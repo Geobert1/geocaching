@@ -1,0 +1,1312 @@
+/* global $, L, bootstrap */
+$(function () {
+    'use strict';
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+    const LS = {
+        get: (k, def) => { try { const v = localStorage.getItem('gc_' + k); return v !== null ? JSON.parse(v) : def; } catch { return def; } },
+        set: (k, v)   => { try { localStorage.setItem('gc_' + k, JSON.stringify(v)); } catch {} },
+    };
+
+    // ── Map init ──────────────────────────────────────────────────────────────
+    const saved  = LS.get('map', null);
+    const map = L.map('map', { zoomControl: false })
+        .setView(saved ? [saved.lat, saved.lng] : [54.75, 9.5], saved ? saved.zoom : 12);
+
+    L.tileLayer(window.GC_TILE_URL || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        maxZoom: 19,
+    }).addTo(map);
+
+    map.on('moveend zoomend', () => {
+        const c = map.getCenter();
+        LS.set('map', { lat: c.lat, lng: c.lng, zoom: map.getZoom() });
+    });
+
+    // ── Marker clustering ─────────────────────────────────────────────────────
+    const cluster = L.markerClusterGroup({
+        maxClusterRadius: 60,
+        showCoverageOnHover: false,
+        spiderfyOnMaxZoom: true,
+    });
+    map.addLayer(cluster);
+
+    // ── Draw layer ────────────────────────────────────────────────────────────
+    const drawnLayer = new L.FeatureGroup();
+    map.addLayer(drawnLayer);
+
+    let drawControl  = null;
+    let drawMode     = 'view';
+    let currentArea  = null;
+
+    function initDrawCtrl(mode) {
+        if (drawControl) map.removeControl(drawControl);
+        drawControl = new L.Control.Draw({
+            position: 'bottomleft',
+            draw: {
+                circle:      mode === 'circle'    ? { shapeOptions: { color: '#0d6efd', weight: 2 } } : false,
+                rectangle:   mode === 'bbox'      ? { shapeOptions: { color: '#0d6efd', weight: 2 }, showArea: false } : false,
+                polygon: false, polyline: false, marker: false, circlemarker: false,
+            },
+            edit: { featureGroup: drawnLayer },
+        });
+        map.addControl(drawControl);
+    }
+
+    // Restore draw-mode + max-age, then init
+    const savedMode   = LS.get('drawmode', 'view');
+    const savedMaxAge = LS.get('maxage', null);
+    drawMode = savedMode;
+    if (drawMode !== 'view') {
+        $('[data-mode="view"]').removeClass('active');
+        $(`[data-mode="${drawMode}"]`).addClass('active');
+        $('#radius-display').toggle(drawMode === 'circle');
+        initDrawCtrl(drawMode);
+    } else {
+        setAreaFromMapView();
+    }
+    if (savedMaxAge) $('#sel-maxage').val(savedMaxAge);
+
+    // Save draw-mode + max-age on change
+    $('#sel-maxage').on('change', () => LS.set('maxage', $('#sel-maxage').val()));
+
+    $('#btn-mode-circle, #btn-mode-bbox, #btn-mode-view').on('click', function () {
+        drawMode = $(this).data('mode');
+        LS.set('drawmode', drawMode);
+        $('#btn-mode-circle, #btn-mode-bbox, #btn-mode-view').removeClass('active');
+        $(this).addClass('active');
+        $('#radius-display').toggle(drawMode === 'circle');
+        drawnLayer.clearLayers();
+        currentArea = null;
+
+        if (drawMode === 'view') {
+            if (drawControl) { map.removeControl(drawControl); drawControl = null; }
+            setAreaFromMapView();
+        } else {
+            initDrawCtrl(drawMode);
+        }
+        refreshSyncBtn();
+    });
+
+    function setAreaFromMapView() {
+        const b = map.getBounds();
+        currentArea = {
+            mode: 'bbox',
+            minLat: b.getSouth(), minLng: b.getWest(),
+            maxLat: b.getNorth(), maxLng: b.getEast(),
+        };
+        refreshSyncBtn();
+    }
+
+    let skipNextDbLoad = false;
+
+    map.on('moveend', function () {
+        if (drawMode === 'view' && drawnLayer.getLayers().length === 0) setAreaFromMapView();
+        if (skipNextDbLoad) { skipNextDbLoad = false; return; }
+        scheduleLoadFromDB();
+    });
+
+    map.on(L.Draw.Event.CREATED, function (e) {
+        drawnLayer.clearLayers();
+        drawnLayer.addLayer(e.layer);
+
+        if (e.layerType === 'circle') {
+            const c = e.layer.getLatLng();
+            const r = Math.round(e.layer.getRadius());
+            currentArea = { mode: 'circle', lat: c.lat, lng: c.lng, radius: r };
+            $('#radius-display').text((r / 1000).toFixed(1) + ' km');
+        } else {
+            const b = e.layer.getBounds();
+            currentArea = {
+                mode: 'bbox',
+                minLat: b.getSouth(), minLng: b.getWest(),
+                maxLat: b.getNorth(), maxLng: b.getEast(),
+            };
+        }
+        // Switch back to view mode — shape stays on map, currentArea preserved for Sync
+        drawMode = 'view';
+        $('#btn-mode-circle, #btn-mode-bbox, #btn-mode-view').removeClass('active');
+        $('#btn-mode-view').addClass('active');
+        $('#radius-display').hide();
+        if (drawControl) { map.removeControl(drawControl); drawControl = null; }
+        refreshSyncBtn();
+    });
+
+    function refreshSyncBtn() {
+        $('#btn-sync').prop('disabled', !currentArea);
+    }
+
+    function switchToViewMode() {
+        drawMode = 'view';
+        $('#btn-mode-circle, #btn-mode-bbox, #btn-mode-view').removeClass('active');
+        $('#btn-mode-view').addClass('active');
+        $('#radius-display').hide();
+        drawnLayer.clearLayers();
+        currentArea = null;
+        if (drawControl) { map.removeControl(drawControl); drawControl = null; }
+        setAreaFromMapView();
+    }
+
+    // ── Cache type styles ─────────────────────────────────────────────────────
+    const TYPE_COLOR = {
+        2: '#16a34a', 3: '#2563eb', 4: '#0891b2', 5: '#92400e',
+        6: '#dc2626', 8: '#d97706', 11: '#7c3aed', 13: '#059669',
+        137: '#65a30d', 453: '#4f46e5', 1304: '#0284c7',
+        1858: '#db2777', 3653: '#be185d', 3773: '#0d9488',
+    };
+    const TYPE_SYMBOL = {
+        2: 'T',  3: '?',  4: 'V',  5: 'L',   6: 'E',
+        8: 'M',  11: '📷', 13: '♻', 137: '⛰', 453: 'Q',
+        1304: 'W', 1858: '★', 3653: '★★', 3773: '⚗',
+    };
+
+    function cacheIcon(type, status, found, foundDate) {
+        const col    = status === 'archived' ? '#9ca3af' : (TYPE_COLOR[type] || '#6b7280');
+        const sym    = TYPE_SYMBOL[type] || '#';
+        const isLong = sym.length > 1;
+        const fs     = sym.length > 2 ? 5 : isLong ? 6.5 : 8.5;
+        const filter = status === 'archived' ? 'grayscale(80%) opacity(.5)'
+                     : status === 'disabled' ? 'opacity(.55)' : '';
+        const svgPin = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="28" viewBox="0 0 20 28">'
+            + '<path d="M10 1C5.03 1 1 5.03 1 10c0 7 9 17 9 17s9-10 9-17c0-4.97-4.03-9-9-9z"'
+            + ' fill="' + col + '" stroke="rgba(0,0,0,.45)" stroke-width="1.2"/>'
+            + '<text x="10" y="10.5" text-anchor="middle" dominant-baseline="middle"'
+            + ' font-size="' + fs + '" font-weight="700" fill="#fff" font-family="Arial,sans-serif">' + sym + '</text>'
+            + '</svg>';
+        const fallback = filter ? '<div style="filter:' + filter + '">' + svgPin + '</div>' : svgPin;
+        const styleAttr = filter ? ' style="filter:' + filter + ';width:22px;height:22px;object-fit:contain"'
+                                 : ' style="width:22px;height:22px;object-fit:contain"';
+        const svgUri = 'data:image/svg+xml,' + encodeURIComponent(fallback);
+        const badge = found
+            ? '<div style="position:absolute;top:-3px;right:-3px;width:11px;height:11px;background:#16a34a;border-radius:50%;border:1.5px solid #fff;display:flex;align-items:center;justify-content:center;">'
+              + '<svg width="6" height="5" viewBox="0 0 7 6" fill="none"><path d="M1 3l1.5 1.5L6 1" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+              + '</div>'
+            : '';
+        return L.divIcon({
+            className: '',
+            html: '<div style="position:relative;width:22px;height:22px;">'
+                + '<img src="assets/img/cache-types/' + type + '.png"' + styleAttr
+                + ' onerror="this.src=\'' + svgUri + '\';this.onerror=null">'
+                + badge + '</div>',
+            iconSize: [22, 22], iconAnchor: [11, 11], popupAnchor: [0, -13],
+        });
+    }
+
+    function makeRouteIcon(num) {
+        const pin = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="28" viewBox="0 0 20 28">`
+            + `<path d="M10 1C5.03 1 1 5.03 1 10c0 7 9 17 9 17s9-10 9-17c0-4.97-4.03-9-9-9z"`
+            + ` fill="#0d6efd" stroke="rgba(0,0,0,.45)" stroke-width="1.2"/>`
+            + `<text x="10" y="10.5" text-anchor="middle" dominant-baseline="middle"`
+            + ` font-size="8.5" font-weight="700" fill="#fff" font-family="Arial,sans-serif">${num}</text>`
+            + `</svg>`;
+        return L.divIcon({
+            className: '',
+            html: pin,
+            iconSize: [20, 28], iconAnchor: [10, 27], popupAnchor: [0, -28],
+        });
+    }
+
+    function refreshAllMarkerIcons() {
+        Object.entries(markerMap).forEach(function ([gc, m]) {
+            const c = cacheReg[gc];
+            if (!c) return;
+            const idx = selOrder.indexOf(gc);
+            m.setIcon(idx > -1 ? makeRouteIcon(idx + 1) : cacheIcon(c.cache_type, c.status, c.found_by_user, c.found_date));
+        });
+    }
+
+    // ── Markers ───────────────────────────────────────────────────────────────
+    const markerMap = {};
+
+    function renderCaches(caches) {
+        // cluster.clearLayers() rebuilds from internal _layers via _generateInitialClusters,
+        // so old markers would reappear. removeLayers() actually removes them from internal state.
+        const oldMarkers = Object.values(markerMap);
+        if (oldMarkers.length) {
+            if (clusteringOn) cluster.removeLayers(oldMarkers);
+            else              oldMarkers.forEach(m => map.removeLayer(m));
+        }
+        Object.keys(markerMap).forEach(k => delete markerMap[k]);
+
+        caches.forEach(function (c) {
+            const selIdx   = selOrder.indexOf(c.gc_code);
+            const icon     = selIdx > -1 ? makeRouteIcon(selIdx + 1) : cacheIcon(c.cache_type, c.status, c.found_by_user, c.found_date);
+            const foundNote = c.found_by_user
+                ? (c.found_date ? `<br><span style="color:#16a34a">✓ Gefunden am ${c.found_date}</span>`
+                                : '<br><span style="color:#16a34a">✓ Gefunden</span>')
+                : '';
+            const m = L.marker([c.lat, c.lng], { icon });
+            m.bindTooltip(
+                `<strong>${escHtml(c.name)}</strong><br>${escHtml(c.cache_type_name)} · D${c.difficulty}/T${c.terrain}${foundNote}`,
+                { direction: 'top', offset: [0, -15] }
+            );
+            m.on('click', function () {
+                if (routeSelectMode) { mapClickRouteSelect(c.gc_code); }
+                else                 { showDetail(c.gc_code); }
+            });
+            if (clusteringOn) { cluster.addLayer(m); } else { map.addLayer(m); }
+            markerMap[c.gc_code] = m;
+        });
+
+        updateStats();
+        renderCacheList(caches);
+        // Re-apply active marker highlight after markers are (re)created
+        if (activeMarkerGc && markerMap[activeMarkerGc]?._icon) {
+            markerMap[activeMarkerGc]._icon.classList.add('marker-active');
+        }
+    }
+
+    let dbLoadTimer;
+    function scheduleLoadFromDB() {
+        clearTimeout(dbLoadTimer);
+        dbLoadTimer = setTimeout(loadFromDB, 350);
+    }
+
+    function loadFromDB() {
+        const b = map.getBounds();
+        $.get('api/caches.php', {
+            s: b.getSouth(), w: b.getWest(), n: b.getNorth(), e: b.getEast(),
+        }).done(d => { if (d.success) renderCaches(d.caches); });
+    }
+
+    loadFromDB();   // initial paint
+
+    // ── Sync ──────────────────────────────────────────────────────────────────
+    $('#btn-sync').on('click', function () {
+        if (!currentArea) return;
+
+        const payload = Object.assign({}, currentArea, {
+            force:         $('#chk-force').prop('checked'),
+            max_age_hours: parseInt($('#sel-maxage').val(), 10) || 24,
+        });
+
+        setStatus('Synchronisiere…', 'text-warning', true);
+        $('#btn-sync').prop('disabled', true);
+
+        $.ajax({
+            url: 'api/sync.php', type: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(payload),
+        }).done(function (d) {
+            if (d.success) {
+                const note = d.skipped ? '(DB-Cache)' : '(geocaching.com)';
+                setStatus(`${d.message} ${note}`, 'text-success');
+                loadFromDB();
+                switchToViewMode();
+            } else {
+                setStatus('Fehler: ' + d.error, 'text-danger');
+            }
+        }).fail(function (xhr) {
+            let err = xhr.responseText;
+            try { err = JSON.parse(err).error; } catch (_) { /* raw */ }
+            setStatus('Fehler: ' + err, 'text-danger');
+        }).always(function () {
+            $('#btn-sync').prop('disabled', false);
+            $('#sync-spinner').hide();
+        });
+    });
+
+    function setStatus(msg, cls, spin) {
+        $('#status-msg')
+            .removeClass('text-warning text-success text-danger text-muted')
+            .addClass(cls).text(msg);
+        $('#sync-spinner').toggle(!!spin);
+    }
+
+    // ── Stats ─────────────────────────────────────────────────────────────────
+    function updateStats() {
+        $.get('api/status.php').done(function (d) {
+            if (!d.success) return;
+            const s = d.stats;
+            $('#stat-total').text(s.total  || 0);
+            $('#stat-active').text(s.active || 0);
+            const ts = s.last_sync
+                ? new Date(s.last_sync.replace(' ', 'T') + 'Z').toLocaleString('de-DE')
+                : '–';
+            $('#stat-lastsync').text(ts);
+        });
+    }
+
+    // ── Sidebar ───────────────────────────────────────────────────────────────
+    let currentCache     = null;
+    let currentLogTotals = [];
+    let currentRecentLogs = [];
+    let activeMarkerGc   = null;
+
+    function setActiveMarker(gcCode) {
+        if (activeMarkerGc && markerMap[activeMarkerGc]?._icon) {
+            markerMap[activeMarkerGc]._icon.classList.remove('marker-active');
+        }
+        activeMarkerGc = gcCode || null;
+        if (activeMarkerGc && markerMap[activeMarkerGc]?._icon) {
+            markerMap[activeMarkerGc]._icon.classList.add('marker-active');
+        }
+    }
+
+    function showDetail(gcCode) {
+        $('#sidebar-detail').html(spinnerHtml('Lade Cache-Details…'));
+        openSidebar();
+        setActiveMarker(gcCode);
+
+        $.get('api/cache_detail.php', { gc_code: gcCode }).done(function (d) {
+            if (!d.success) {
+                $('#sidebar-detail').html(alertHtml(d.error, 'danger'));
+                return;
+            }
+            currentCache      = d.cache;
+            currentLogTotals  = d.log_totals  || [];
+            currentRecentLogs = d.recent_logs || [];
+
+            $('#sidebar-detail').html(buildDetailHtml(currentCache));
+            bindHintDecoder('#sidebar-detail');
+
+            // Auto-load web details if not yet in DB
+            if (!d.cache.encoded_hints && !d.cache.short_description && !d.cache.long_description) {
+                fetchWebDetails(gcCode);
+            }
+        }).fail(function () {
+            $('#sidebar-detail').html(alertHtml('Verbindungsfehler.', 'danger'));
+        });
+    }
+
+    function fetchWebDetails(gcCode) {
+        $('#web-details-status').html(spinnerSmall() + ' Lade Details…');
+        $.get('api/cache_detail.php', { gc_code: gcCode, refresh_details: 1 }).done(function (d) {
+            if (!d.success) { $('#web-details-status').empty(); return; }
+
+            // Merge into currentCache so modal always has fresh data
+            if (currentCache && d.cache.gc_code === currentCache.gc_code) {
+                currentCache.encoded_hints     = d.cache.encoded_hints;
+                currentCache.short_description = d.cache.short_description;
+                currentCache.long_description  = d.cache.long_description;
+                if (d.log_totals   && d.log_totals.length)   currentLogTotals  = d.log_totals;
+                if (d.recent_logs  && d.recent_logs.length)  currentRecentLogs = d.recent_logs;
+            }
+
+            // Update sidebar hint
+            if (d.cache.encoded_hints) {
+                $('#hint-placeholder').html(buildHintHtml(d.cache.encoded_hints));
+                bindHintDecoder('#hint-placeholder');
+            }
+            // Update sidebar short description only
+            if (d.cache.short_description) {
+                $('#desc-placeholder').html(buildShortDescHtml(d.cache.short_description));
+            }
+            $('#web-details-status').empty();
+        }).fail(function () { $('#web-details-status').empty(); });
+    }
+
+    function bindHintDecoder(scope) {
+        $(scope).find('#btn-decode-hint').on('click', function () {
+            const $enc = $(this).closest('.hint-box').find('.hint-encoded');
+            $enc.text(rot13($enc.text())).addClass('text-success');
+            $(this).remove();
+        });
+    }
+
+    function buildHintHtml(encoded) {
+        return `<div class="hint-box">
+          <div class="sidebar-header text-muted text-uppercase mb-1">Hinweis (ROT13)</div>
+          <div class="font-monospace small border rounded p-2 bg-light hint-encoded" style="word-break:break-all;">${escHtml(encoded)}</div>
+          <button class="btn btn-sm btn-outline-secondary mt-1" id="btn-decode-hint">Entschlüsseln</button>
+        </div>`;
+    }
+
+    function buildShortDescHtml(html) {
+        return `<div class="mb-2">
+          <div class="text-muted text-uppercase mb-1" style="font-size:.68rem;letter-spacing:.04em">Kurzbeschreibung</div>
+          <div class="small border rounded p-2 bg-light" style="max-height:100px;overflow:auto;">${html}</div>
+        </div>`;
+    }
+
+    // ── Detail Modal ─────────────────────────────────────────────────────────
+    $(document).on('click', '#btn-open-detail-modal', function () {
+        if (!currentCache) return;
+        const c = currentCache;
+        const gcUrl = `https://www.geocaching.com/geocache/${c.gc_code}`;
+        $('#cache-modal-title').text(c.name);
+        $('#cache-modal-link').attr('href', gcUrl + '?log=y');
+        $('#cache-modal-body').html(buildModalHtml(c, currentLogTotals, currentRecentLogs));
+        bindHintDecoder('#cache-modal-body');
+        new bootstrap.Modal(document.getElementById('cache-detail-modal')).show();
+
+        // Logs nachladen falls noch nicht vorhanden
+        if (!currentRecentLogs.length) {
+            $('#modal-recent-logs').html(
+                `<div class="text-muted small">${spinnerSmall()} Lade Logs…</div>`
+            );
+            $.get('api/cache_detail.php', { gc_code: c.gc_code, refresh_details: 1 })
+                .done(function (d) {
+                    if (!d.success) { $('#modal-recent-logs').empty(); return; }
+                    if (d.log_totals  && d.log_totals.length)  { currentLogTotals  = d.log_totals;  $('#modal-log-totals').html(buildModalLogTotalsHtml(d.log_totals)); }
+                    if (d.recent_logs && d.recent_logs.length) { currentRecentLogs = d.recent_logs; $('#modal-recent-logs').html(buildRecentLogsHtml(d.recent_logs)); }
+                    else $('#modal-recent-logs').html('<p class="text-muted small">Keine Logs verfügbar.</p>');
+                })
+                .fail(() => $('#modal-recent-logs').html('<p class="text-muted small text-danger">Fehler beim Laden.</p>'));
+        }
+    });
+
+    function buildModalLogTotalsHtml(logTotals) {
+        const LOGTYPES = {'Found it':'✓',"Didn't find it":'✗','Write note':'📝','Attended':'🎉','Will Attend':'📅','Needs Maintenance':'🔧','Temporarily disable listing':'🔒','Enable listing':'🔓','Owner maintenance':'🔧','Owner attention requested':'⚠️'};
+        if (!logTotals || !logTotals.length) return '';
+        return logTotals.filter(t => t.count > 0).map(t => {
+            const icon = LOGTYPES[t.name] || '📋';
+            const date = t.last_date ? `<span class="text-muted ms-1" style="font-size:.75rem;">${t.last_date}</span>` : '';
+            return `<span class="badge bg-light text-dark border d-inline-flex align-items-center gap-1" style="font-size:.8rem;">${icon} ${t.count}× ${escHtml(t.name)}${date}</span>`;
+        }).join('');
+    }
+
+    function fmtDate(iso) {
+        if (!iso) return '';
+        const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        return m ? `${m[3]}.${m[2]}.${m[1]}` : iso;
+    }
+
+    function buildRecentLogsHtml(logs) {
+        const LOGTYPES = {'Found it':'✓',"Didn't find it":'✗','Write note':'📝','Attended':'🎉','Will Attend':'📅','Needs Maintenance':'🔧','Temporarily disable listing':'🔒','Enable listing':'🔓','Owner maintenance':'🔧','Owner attention requested':'⚠️'};
+        return logs.map(l => {
+            const icon = LOGTYPES[l.type] || '📋';
+            const fav  = l.fav ? ' ⭐' : '';
+            const date = fmtDate(l.date);
+            const txt  = l.text
+                ? `<div class="text-muted mt-1" style="font-size:.82rem;white-space:pre-wrap;">${escHtml(l.text.slice(0, 400))}${l.text.length > 400 ? '…' : ''}</div>`
+                : '';
+            return `<div class="border-start border-2 border-primary ps-3 mb-3">
+              <div class="d-flex justify-content-between align-items-baseline">
+                <span class="fw-semibold small">${icon} ${escHtml(l.user)}${fav}</span>
+                <span class="badge bg-light text-secondary" style="font-size:.72rem;">${date}</span>
+              </div>
+              <div class="text-muted" style="font-size:.75rem;">${escHtml(l.type)}</div>
+              ${txt}
+            </div>`;
+        }).join('');
+    }
+
+    function buildModalHtml(c, logTotals, recentLogs) {
+        const SI = 'assets/img/icons/';
+        const stars = n => {
+            n = parseFloat(n) || 0;
+            const full  = Math.floor(n);
+            const half  = (n % 1) >= 0.5 ? 1 : 0;
+            const empty = 5 - full - half;
+            const s = (file, op) => `<img src="${SI}${file}" width="16" height="16" style="object-fit:contain${op ? ';opacity:' + op : ''}">`;
+            return Array(full).fill(s('star5.png')).join('')
+                 + (half ? s('star3.png') : '')
+                 + Array(empty).fill(s('star1.png', .25)).join('')
+                 + ` <span class="text-muted">${n.toFixed(1)}</span>`;
+        };
+
+        const badge = status => ({
+            active:   '<span class="badge bg-success">Aktiv</span>',
+            disabled: '<span class="badge bg-warning text-dark">Deaktiviert</span>',
+            archived: '<span class="badge bg-secondary">Archiviert</span>',
+        }[status] || '');
+
+        const foundRow = c.found_by_user
+            ? `<tr><th style="color:#16a34a">✓ Gefunden</th><td style="color:#16a34a">${c.found_date || 'Datum unbekannt'}</td></tr>`
+            : '';
+
+        const longDesc = c.long_description
+            ? `<section class="mb-4">
+                <h6 class="text-uppercase text-muted fw-semibold mb-2" style="letter-spacing:.05em;font-size:.75rem;">Beschreibung</h6>
+                <div class="border rounded p-3 bg-light cache-description">${c.long_description}</div>
+               </section>`
+            : '';
+
+        const shortDesc = c.short_description
+            ? `<section class="mb-3">
+                <h6 class="text-uppercase text-muted fw-semibold mb-2" style="letter-spacing:.05em;font-size:.75rem;">Kurzbeschreibung</h6>
+                <div class="border rounded p-3 bg-light cache-description">${c.short_description}</div>
+               </section>`
+            : '';
+
+        const hintSection = c.encoded_hints
+            ? `<section class="mb-4">
+                <h6 class="text-uppercase text-muted fw-semibold mb-2" style="letter-spacing:.05em;font-size:.75rem;">Hinweis (ROT13)</h6>
+                <div class="hint-box">
+                  <div class="font-monospace border rounded p-3 bg-light hint-encoded" style="word-break:break-all;">${escHtml(c.encoded_hints)}</div>
+                  <button class="btn btn-sm btn-outline-secondary mt-2" id="btn-decode-hint">Entschlüsseln</button>
+                </div>
+               </section>`
+            : '';
+
+        const logSection = `<section class="mb-3">
+                <h6 class="text-uppercase text-muted fw-semibold mb-2" style="letter-spacing:.05em;font-size:.75rem;">Log-Statistik</h6>
+                <div id="modal-log-totals" class="d-flex flex-wrap gap-2">${buildModalLogTotalsHtml(logTotals)}</div>
+               </section>`;
+
+        const recentSection = `<section class="mb-2">
+                <h6 class="text-uppercase text-muted fw-semibold mb-3" style="letter-spacing:.05em;font-size:.75rem;">Letzte Logs</h6>
+                <div id="modal-recent-logs">${recentLogs && recentLogs.length ? buildRecentLogsHtml(recentLogs) : ''}</div>
+               </section>`;
+
+        return `
+<div class="d-flex align-items-center gap-2 mb-3">
+  <a href="https://www.geocaching.com/geocache/${c.gc_code}" target="_blank" class="badge bg-primary text-decoration-none fs-6">${escHtml(c.gc_code)}</a>
+  ${badge(c.status)}
+  <span class="text-muted small">${escHtml(c.cache_type_name || '')} · ${escHtml(c.container_size || '–')}</span>
+</div>
+
+<div class="row g-2 mb-3">
+  <div class="col-6">
+    <div class="border rounded p-2 text-center">
+      <div class="text-muted mb-1" style="font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">Schwierigkeit</div>
+      <div>${stars(c.difficulty)}</div>
+    </div>
+  </div>
+  <div class="col-6">
+    <div class="border rounded p-2 text-center">
+      <div class="text-muted mb-1" style="font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">Gelände</div>
+      <div>${stars(c.terrain)}</div>
+    </div>
+  </div>
+</div>
+
+<table class="table table-sm mb-4">
+  ${foundRow}
+  <tr><th class="text-muted fw-normal" style="width:35%">Owner</th><td>${escHtml(c.owner || '–')}</td></tr>
+  <tr><th class="text-muted fw-normal">Versteckt</th><td>${c.placed_date || '–'}</td></tr>
+  <tr><th class="text-muted fw-normal">Letzter Fund</th><td>${c.last_found_date || '–'}</td></tr>
+  <tr><th class="text-muted fw-normal">Favoriten</th><td>★ ${c.favorite_points || 0}</td></tr>
+  <tr><th class="text-muted fw-normal">Koordinaten</th><td class="font-monospace">${(+c.lat).toFixed(6)}, ${(+c.lng).toFixed(6)}</td></tr>
+</table>
+
+${shortDesc}
+${longDesc}
+${hintSection}
+${logSection}
+${recentSection}`;
+    }
+
+    function openSidebar()  { $('#sidebar').addClass('sidebar-open'); }
+    function closeSidebar() {
+        $('#sidebar').removeClass('sidebar-open');
+        $('#sidebar-detail').html(defaultSidebarHtml());
+        setActiveMarker(null);
+    }
+
+    // Re-apply active marker class after Leaflet re-renders icons (e.g. after cluster expand)
+    map.on('layeradd', function (e) {
+        if (activeMarkerGc && e.layer === markerMap[activeMarkerGc] && e.layer._icon) {
+            e.layer._icon.classList.add('marker-active');
+        }
+    });
+
+    $(document).on('click', '#btn-close-sidebar', closeSidebar);
+
+    // ── Hilfe-Modal ───────────────────────────────────────────────────────────
+    $('#btn-help').on('click', function () {
+        const iframe = document.getElementById('help-iframe');
+        if (!iframe.src || iframe.src === window.location.href) {
+            iframe.src = 'help.php?embedded';
+        }
+        new bootstrap.Modal(document.getElementById('help-modal')).show();
+    });
+
+    // ── Detail HTML builder ───────────────────────────────────────────────────
+    function buildLogTotalsHtml(logTotals) {
+        const ICONS = {
+            'Found it': '✓', "Didn't find it": '✗', 'Write note': '📝',
+            'Attended': '🎉', 'Will Attend': '📅', 'Needs Maintenance': '🔧',
+            'Needs Archived': '🚫', 'Publish Listing': '📢',
+            'Temporarily disable listing': '🔒', 'Enable listing': '🔓',
+            'Owner maintenance': '🔧', 'Owner attention requested': '⚠️',
+        };
+        return logTotals
+            .filter(t => t.count > 0)
+            .map(t => {
+                const icon = ICONS[t.name] || '📋';
+                const date = t.last_date
+                    ? ` <span class="text-muted" style="font-size:.68rem;">${t.last_date}</span>`
+                    : '';
+                return `<div class="d-flex justify-content-between align-items-baseline py-0" style="font-size:.75rem;">` +
+                    `<span>${icon} <strong>${t.count}×</strong> ${escHtml(t.name)}</span>${date}</div>`;
+            })
+            .join('');
+    }
+
+    function buildDetailHtml(c) {
+        const badge = status => ({
+            active:   '<span class="badge bg-success">Aktiv</span>',
+            disabled: '<span class="badge bg-warning text-dark">Deaktiviert</span>',
+            archived: '<span class="badge bg-secondary">Archiviert</span>',
+        }[status] || '');
+
+        const SI = 'assets/img/icons/';
+        const stars = n => {
+            n = parseFloat(n) || 0;
+            const full  = Math.floor(n);
+            const half  = (n % 1) >= 0.5 ? 1 : 0;
+            const empty = 5 - full - half;
+            const s = (file, op) => `<img src="${SI}${file}" width="15" height="15" style="object-fit:contain${op ? ';opacity:' + op : ''}">`;
+            return Array(full).fill(s('star5.png')).join('')
+                 + (half ? s('star3.png') : '')
+                 + Array(empty).fill(s('star1.png', .25)).join('')
+                 + ` <small class="text-muted">${n.toFixed(1)}</small>`;
+        };
+
+        const syncDate = c.last_synced
+            ? new Date(c.last_synced.replace(' ', 'T') + 'Z').toLocaleString('de-DE')
+            : '–';
+
+        const gcUrl = `https://www.geocaching.com/geocache/${c.gc_code}`;
+
+        const premiumIcon = c.premium_only
+            ? `<img src="${SI}row2_col1_glasses_filled.png" width="15" height="15" title="Premium" style="object-fit:contain;vertical-align:middle" class="ms-1">`
+            : '';
+
+        const foundRow = c.found_by_user
+            ? `<tr><th class="fw-normal py-0" style="color:#16a34a">✓ Gefunden</th>
+               <td class="py-0" style="color:#16a34a">${c.found_date || 'Datum unbekannt'}</td></tr>`
+            : '';
+
+        const hintSection = c.encoded_hints
+            ? `<div class="mb-2">${buildHintHtml(c.encoded_hints)}</div>`
+            : '<div id="hint-placeholder"></div>';
+
+        let descSection;
+        if (c.short_description) {
+            descSection = `<div id="desc-placeholder">${buildShortDescHtml(c.short_description)}</div>`;
+        } else if (c.long_description) {
+            const preview = strip300(c.long_description);
+            const fullLen = (c.long_description || '').replace(/<[^>]*>/g, '').trim().length;
+            const previewHtml = escHtml(preview) + (preview.length < fullLen ? '…' : '');
+            descSection = `<div id="desc-placeholder">${buildShortDescHtml(previewHtml)}</div>`;
+        } else {
+            descSection = '<div id="desc-placeholder"></div>';
+        }
+
+        return `
+<div class="p-2">
+  <div class="d-flex justify-content-between align-items-start mb-1">
+    <div class="d-flex align-items-center flex-wrap gap-1">
+      <a href="${gcUrl}" target="_blank" class="badge bg-primary text-decoration-none">${escHtml(c.gc_code)}</a>
+      ${badge(c.status)}${premiumIcon}
+    </div>
+    <button class="btn btn-sm btn-link p-0 text-secondary" id="btn-close-sidebar">✕</button>
+  </div>
+
+  <div class="fw-bold small mb-0">${escHtml(c.name)}</div>
+  <div class="text-muted mb-2" style="font-size:.75rem;">${escHtml(c.cache_type_name || '')} · ${escHtml(c.container_size || '–')}</div>
+
+  <div class="d-flex gap-2 mb-2">
+    <div class="flex-fill border rounded px-2 py-1 text-center">
+      <div class="text-muted mb-1" style="font-size:.68rem;text-transform:uppercase;letter-spacing:.04em">Schwierigkeit</div>
+      <div>${stars(c.difficulty)}</div>
+    </div>
+    <div class="flex-fill border rounded px-2 py-1 text-center">
+      <div class="text-muted mb-1" style="font-size:.68rem;text-transform:uppercase;letter-spacing:.04em">Gelände</div>
+      <div>${stars(c.terrain)}</div>
+    </div>
+  </div>
+
+  <table class="table table-sm table-borderless mb-2" style="font-size:.78rem;">
+    ${foundRow}
+    <tr><th class="text-muted fw-normal py-0" style="width:44%">Owner</th>
+        <td class="py-0">${escHtml(c.owner || '–')}</td></tr>
+    <tr><th class="text-muted fw-normal py-0">Versteckt</th>
+        <td class="py-0">${c.placed_date || '–'}</td></tr>
+    <tr><th class="text-muted fw-normal py-0">Letzter Fund</th>
+        <td class="py-0">${c.last_found_date || '–'}</td></tr>
+    <tr><th class="text-muted fw-normal py-0">Favoriten</th>
+        <td class="py-0">★ ${c.favorite_points || 0}</td></tr>
+    <tr><th class="text-muted fw-normal py-0">Koordinaten</th>
+        <td class="py-0 font-monospace" style="font-size:.72rem;">${(+c.lat).toFixed(5)}, ${(+c.lng).toFixed(5)}</td></tr>
+  </table>
+
+  ${descSection}
+  ${hintSection}
+  <div id="web-details-status"></div>
+
+  <hr class="my-2">
+  <button class="btn btn-sm btn-outline-primary w-100 mb-1" id="btn-open-detail-modal">Vollständige Details</button>
+  <p class="text-muted mb-0" style="font-size:.65rem;">Sync: ${syncDate}</p>
+</div>`;
+    }
+
+    function buildLogsHtml(logs) {
+        if (!logs || !logs.length) return '<p class="text-muted small">Keine Logs vorhanden.</p>';
+
+        const ICON = {
+            'Found It': '😀', "Didn't Find It": '😞', 'Write Note': '📝',
+            'Enabled Cache': '✅', 'Disabled Cache': '🚫', 'Needs Maintenance': '🔧',
+            'Publish Listing': '📢', 'Attended': '🎉',
+        };
+
+        return logs.map(l => {
+            const icon = ICON[l.log_type] || '📋';
+            const txt  = l.log_text
+                ? `<div class="mt-1 text-muted small">${escHtml(l.log_text.slice(0, 220))}${l.log_text.length > 220 ? '…' : ''}</div>`
+                : '';
+            return `
+<div class="border-start border-2 border-primary ps-2 mb-2">
+  <div class="d-flex justify-content-between align-items-start">
+    <span class="small fw-semibold">${icon} ${escHtml(l.finder_name || '?')}</span>
+    <span class="text-muted" style="font-size:.75rem;">${l.log_date || ''}</span>
+  </div>
+  <div class="text-muted" style="font-size:.75rem;">${escHtml(l.log_type || '')}</div>
+  ${txt}
+</div>`;
+        }).join('');
+    }
+
+    function defaultSidebarHtml() {
+        return `
+<div class="p-3 text-center text-muted mt-5">
+  <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="currentColor"
+       class="bi bi-geo-alt mb-3 opacity-25" viewBox="0 0 16 16">
+    <path d="M12.166 8.94c-.524 1.062-1.234 2.12-1.96 3.07A31.493 31.493 0 0 1 8 14.58a31.481 31.481 0 0 1-2.206-2.57c-.726-.95-1.436-2.008-1.96-3.07C3.304 7.867 3 6.862 3 6a5 5 0 0 1 10 0c0 .862-.305 1.867-.834 2.94zM8 16s6-5.686 6-10A6 6 0 0 0 2 6c0 4.314 6 10 6 10z"/>
+    <path d="M8 8a2 2 0 1 1 0-4 2 2 0 0 1 0 4zm0 1a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/>
+  </svg>
+  <p>Klicke auf einen Cache-Marker,<br>um die Details anzuzeigen.</p>
+  <hr>
+  <div class="text-start small">
+    <div class="mb-1"><span class="badge" style="background:#22c55e">T</span> Traditional</div>
+    <div class="mb-1"><span class="badge" style="background:#3b82f6">?</span> Mystery</div>
+    <div class="mb-1"><span class="badge" style="background:#f59e0b">M</span> Multi</div>
+    <div class="mb-1"><span class="badge" style="background:#84cc16">EC</span> EarthCache</div>
+    <div class="mb-1"><span class="badge" style="background:#a855f7">W</span> Wherigo</div>
+    <div class="mb-1"><span class="badge" style="background:#ef4444">E</span> Event</div>
+    <div class="mb-1"><span class="badge" style="background:#06b6d4">V</span> Virtual</div>
+    <div><span class="badge" style="background:#9ca3af">–</span> Archiviert</div>
+  </div>
+</div>`;
+    }
+
+    $('#sidebar-detail').html(defaultSidebarHtml());
+    updateStats();
+
+    // ── Cache registry ────────────────────────────────────────────────────────
+    // Persists cache objects across map moves so route calc works even if cache
+    // scrolls out of view between selection and calculation.
+    const cacheReg = {};
+
+    // ── Left panel state ──────────────────────────────────────────────────────
+    let panelCaches    = [];
+    let selOrder        = [];   // mixed: gc_codes + '_wp_N' custom ids
+    let customWaypoints = {};   // '_wp_N' -> {name, lat, lng, marker}
+    let customWpCounter = 0;
+    let routeLayer      = null;
+    let inRouteMode     = false;
+    let routeSelectMode = false;
+
+    function getWaypoint(id) {
+        if (customWaypoints[id]) {
+            const wp = customWaypoints[id];
+            return { name: wp.name, lat: wp.lat, lng: wp.lng, isCache: false, color: '#7c3aed' };
+        }
+        const c = cacheReg[id];
+        if (c) return { name: c.name, lat: +c.lat, lng: +c.lng, isCache: true, color: TYPE_COLOR[c.cache_type] || '#6b7280' };
+        return null;
+    }
+
+    function setRouteSelectMode(on) {
+        routeSelectMode = on;
+        $('#btn-route-mode').toggleClass('active', on);
+        $('#route-mode-controls').toggleClass('d-none', !on).toggleClass('d-flex', on);
+
+        if (on) {
+            setPanelOpen(true);
+            renderSelectionList();
+            $('#map').addClass('route-mode');
+        }
+
+        if (!on) {
+            inRouteMode = false;
+            selOrder = [];
+            $('#map').removeClass('route-mode');
+            Object.values(customWaypoints).forEach(wp => map.removeLayer(wp.marker));
+            customWaypoints = {};
+            customWpCounter = 0;
+            if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+            renderCaches(panelCaches);
+            updateSelBadges();
+            updateRouteBtn();
+            setPanelOpen(false);
+            $('#list-footer').html(
+                '<button id="btn-clear-sel" class="btn btn-sm btn-outline-secondary w-100" disabled>Auswahl löschen</button>'
+            );
+        }
+    }
+
+    // ── Zoom buttons ──────────────────────────────────────────────────────────
+    $('#btn-zoom-in').on('click',  function () { map.zoomIn(); });
+    $('#btn-zoom-out').on('click', function () { map.zoomOut(); });
+
+    // ── Clustering toggle ─────────────────────────────────────────────────────
+    let clusteringOn = true;
+
+    $('#btn-toggle-cluster').on('click', function () {
+        clusteringOn = !clusteringOn;
+        $(this).toggleClass('active', clusteringOn);
+        if (clusteringOn) {
+            Object.values(markerMap).forEach(m => { map.removeLayer(m); cluster.addLayer(m); });
+            if (!map.hasLayer(cluster)) map.addLayer(cluster);
+        } else {
+            map.removeLayer(cluster);
+            Object.values(markerMap).forEach(m => map.addLayer(m));
+        }
+    });
+
+    function setPanelOpen(open) {
+        $('#list-panel').toggleClass('panel-open', open);
+        $('#map-area').css('margin-left', open ? '300px' : '');
+        $('#map-area').one('transitionend', () => map.invalidateSize({ animate: false }));
+        LS.set('panel', open);
+    }
+
+    // Restore panel state
+    if (LS.get('panel', false)) {
+        setPanelOpen(true);
+        // list will be populated once loadFromDB fires
+    }
+
+    // ☰ button: just opens/closes the list panel; route-mode independent
+    $('#btn-toggle-list').on('click', function () {
+        const opening = !$('#list-panel').hasClass('panel-open');
+        setPanelOpen(opening);
+        if (opening && !inRouteMode) renderCacheList(panelCaches);
+    });
+
+    // Route-mode button (navbar): toggle selection mode
+    $('#btn-route-mode').on('click', function () {
+        setRouteSelectMode(!routeSelectMode);
+    });
+
+    // Cache clicked in route-mode: toggle selection
+    function mapClickRouteSelect(gcCode) {
+        const idx = selOrder.indexOf(gcCode);
+        if (idx > -1) { selOrder.splice(idx, 1); } else { selOrder.push(gcCode); }
+        refreshAllMarkerIcons();
+        if (!$('#list-panel').hasClass('panel-open')) setPanelOpen(true);
+        renderSelectionList();
+        updateRouteBtn();
+    }
+
+    // ── Route selection list (shown in left panel while in routeSelectMode) ────
+    function renderSelectionList() {
+        if (!routeSelectMode || inRouteMode) return;
+        $('#list-count').text(selOrder.length);
+        if (!selOrder.length) {
+            $('#list-body').html(
+                '<p class="text-muted small p-3 mb-0">Noch keine Punkte ausgewählt.<br>' +
+                'Klicke auf einen Cache-Marker oder auf eine leere Stelle der Karte für einen eigenen Wegpunkt (lila).</p>'
+            );
+            return;
+        }
+        const rows = selOrder.map(function (id, i) {
+            const wp = getWaypoint(id);
+            if (!wp) return '';
+            const numBadge = `<span class="route-num" style="background:${wp.color};flex-shrink:0">${i + 1}</span>`;
+            const sub = wp.isCache ? '' : '<div style="font-size:.7rem;color:#9ca3af">Eigener Wegpunkt</div>';
+            return `<div class="sel-row d-flex align-items-center gap-2 px-2 py-1 border-bottom" draggable="true" data-id="${escHtml(id)}">
+                <span class="drag-handle text-muted" style="cursor:grab;user-select:none;font-size:1.1rem;line-height:1;flex-shrink:0">⠿</span>
+                ${numBadge}
+                <div class="flex-grow-1 overflow-hidden">
+                    <div class="small fw-semibold text-truncate">${escHtml(wp.name)}</div>
+                    ${sub}
+                </div>
+                <button class="btn btn-link text-danger p-0 btn-remove-wp" data-id="${escHtml(id)}"
+                        style="font-size:.85rem;line-height:1;flex-shrink:0" title="Entfernen">✕</button>
+            </div>`;
+        }).join('');
+        $('#list-body').html(rows);
+    }
+
+    // Remove single waypoint via ✕ button
+    $(document).on('click', '.btn-remove-wp', function (e) {
+        e.stopPropagation();
+        const id = $(this).data('id');
+        selOrder = selOrder.filter(x => x !== id);
+        if (customWaypoints[id]) {
+            map.removeLayer(customWaypoints[id].marker);
+            delete customWaypoints[id];
+        }
+        refreshAllMarkerIcons();
+        renderSelectionList();
+        updateRouteBtn();
+    });
+
+    // Drag-and-drop reordering
+    let dragId = null;
+    $(document).on('dragstart', '.sel-row', function (e) {
+        dragId = $(this).data('id');
+        e.originalEvent.dataTransfer.effectAllowed = 'move';
+    });
+    $(document).on('dragover', '.sel-row', function (e) {
+        e.preventDefault();
+        $(this).addClass('drag-over');
+    });
+    $(document).on('dragleave', '.sel-row', function () {
+        $(this).removeClass('drag-over');
+    });
+    $(document).on('drop', '.sel-row', function (e) {
+        e.preventDefault();
+        $(this).removeClass('drag-over');
+        const targetId = $(this).data('id');
+        if (dragId && targetId && dragId !== targetId) {
+            const from = selOrder.indexOf(String(dragId));
+            const to   = selOrder.indexOf(String(targetId));
+            if (from > -1 && to > -1) {
+                selOrder.splice(from, 1);
+                selOrder.splice(to, 0, String(dragId));
+            }
+        }
+        dragId = null;
+        renderSelectionList();
+        updateRouteBtn();
+    });
+
+    // ── Custom waypoint: leerer Kartenklick in Route-Mode ────────────────────
+    map.on('click', function (e) {
+        if (!routeSelectMode) return;
+
+        customWpCounter++;
+        const id   = '_wp_' + customWpCounter;
+        const name = 'Wegpunkt ' + customWpCounter;
+        const marker = L.marker([e.latlng.lat, e.latlng.lng], {
+            icon: L.divIcon({
+                className: '',
+                html: `<div class="custom-wp-pin">${customWpCounter}</div>`,
+                iconSize: [26, 26], iconAnchor: [13, 13],
+            }),
+            draggable: true,
+        }).addTo(map);
+
+        marker.on('dragend', function () {
+            const ll = marker.getLatLng();
+            customWaypoints[id].lat = ll.lat;
+            customWaypoints[id].lng = ll.lng;
+        });
+
+        customWaypoints[id] = { name, lat: e.latlng.lat, lng: e.latlng.lng, marker };
+        selOrder.push(id);
+        if (!$('#list-panel').hasClass('panel-open')) setPanelOpen(true);
+        renderSelectionList();
+        updateRouteBtn();
+    });
+
+    $(document).on('click', '#btn-close-list', function () {
+        setPanelOpen(false);
+    });
+
+    function renderCacheList(caches) {
+        panelCaches = caches;
+        caches.forEach(c => { cacheReg[c.gc_code] = c; });
+
+        if (routeSelectMode) { renderSelectionList(); return; }
+        if (inRouteMode) return;
+
+        $('#list-count').text(caches.length);
+
+        if (!caches.length) {
+            $('#list-body').html('<p class="text-muted small p-3">Keine Caches in der Ansicht.</p>');
+            return;
+        }
+
+        const rows = caches.map(function (c) {
+            const idx = selOrder.indexOf(c.gc_code);
+            const col = TYPE_COLOR[c.cache_type] || '#6b7280';
+            return '<div class="cache-row" data-gc="' + escHtml(c.gc_code) + '">' +
+                '<span class="sel-badge' + (idx > -1 ? ' active' : '') + '">' +
+                    (idx > -1 ? idx + 1 : '') + '</span>' +
+                '<div class="flex-grow-1 overflow-hidden">' +
+                    '<div class="small fw-semibold text-truncate">' + escHtml(c.name) + '</div>' +
+                    '<div style="font-size:.71rem;color:#6b7280">' +
+                        escHtml(c.cache_type_name || '') + ' &middot; ' +
+                        '<span style="color:' + col + '">D' + c.difficulty + '/T' + c.terrain + '</span>' +
+                    '</div>' +
+                '</div></div>';
+        }).join('');
+
+        $('#list-body').html(rows);
+    }
+
+    $(document).on('click', '.cache-row', function () {
+        const gc  = $(this).data('gc');
+        const idx = selOrder.indexOf(gc);
+        if (idx > -1) { selOrder.splice(idx, 1); } else { selOrder.push(gc); }
+        refreshAllMarkerIcons();
+        updateSelBadges();
+        updateRouteBtn();
+        if (routeSelectMode) {
+            showDetail(gc);
+            openSidebar();
+        }
+    });
+
+    $(document).on('mouseenter', '.cache-row', function () {
+        const m = markerMap[$(this).data('gc')];
+        if (m?._icon) m._icon.classList.add('marker-highlight');
+    });
+    $(document).on('mouseleave', '.cache-row', function () {
+        const m = markerMap[$(this).data('gc')];
+        if (m?._icon) m._icon.classList.remove('marker-highlight');
+    });
+
+    function updateSelBadges() {
+        $('.cache-row').each(function () {
+            const gc  = $(this).data('gc');
+            const idx = selOrder.indexOf(gc);
+            const $b  = $(this).find('.sel-badge');
+            if (idx > -1) {
+                $b.addClass('active').text(idx + 1);
+                $(this).addClass('selected');
+            } else {
+                $b.removeClass('active').text('');
+                $(this).removeClass('selected');
+            }
+        });
+    }
+
+    function updateRouteBtn() {
+        const n = selOrder.length;
+        $('#sel-count').text(n);
+        $('#btn-calc-route').prop('disabled', n < 2);
+        $('#btn-clear-sel').prop('disabled', n === 0);
+    }
+
+    $(document).on('click', '#btn-clear-sel', function () {
+        selOrder = [];
+        Object.values(customWaypoints).forEach(wp => map.removeLayer(wp.marker));
+        customWaypoints = {};
+        customWpCounter = 0;
+        refreshAllMarkerIcons();
+        if (routeSelectMode) { renderSelectionList(); } else { renderCaches(panelCaches); updateSelBadges(); }
+        updateRouteBtn();
+    });
+
+    $(document).on('click', '#btn-calc-route', calcRoute);
+
+    async function calcRoute() {
+        let caches = selOrder.map(id => getWaypoint(id)).filter(Boolean);
+        if (caches.length < 2) return;
+        if ($('#chk-roundtrip').prop('checked')) caches = [...caches, { ...caches[0] }];
+
+        inRouteMode = true;
+        $('#list-body').html(
+            '<div class="text-center text-muted p-4">' +
+            '<div class="spinner-border spinner-border-sm me-2"></div>Route wird berechnet…</div>'
+        );
+
+        const legResults = await Promise.all(
+            caches.slice(0, -1).map((c, i) => {
+                const lonlats = (+c.lng).toFixed(6) + ',' + (+c.lat).toFixed(6) + '|' +
+                                (+caches[i + 1].lng).toFixed(6) + ',' + (+caches[i + 1].lat).toFixed(6);
+                const ctrl = new AbortController();
+                setTimeout(() => ctrl.abort(), 15000);
+                return fetch(
+                    'https://brouter.de/brouter?lonlats=' + lonlats +
+                    '&profile=trekking&alternativeidx=0&format=geojson',
+                    { signal: ctrl.signal }
+                ).then(r => r.ok ? r.json() : null).catch(() => null);
+            })
+        );
+
+        // Per-leg: each leg independently uses Brouter or falls back to straight line
+        const legs = [], allCoords = [];
+        legResults.forEach((r, i) => {
+            const feat   = r?.features?.[0];
+            const coords = feat?.geometry?.coordinates;
+            if (coords?.length >= 2) {
+                legs.push({ distance: parseFloat(feat.properties?.['track-length'] || 0) });
+                allCoords.push(...(allCoords.length === 0 ? coords : coords.slice(1)));
+            } else {
+                const from = caches[i], to = caches[i + 1];
+                legs.push({ distance: hvDist(from, to), fallback: true });
+                const seg = [[+from.lng, +from.lat], [+to.lng, +to.lat]];
+                allCoords.push(...(allCoords.length === 0 ? seg : seg.slice(1)));
+            }
+        });
+        const geometry = allCoords.length > 1 ? { type: 'LineString', coordinates: allCoords } : null;
+
+        // Draw route on map
+        if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+        if (geometry) {
+            routeLayer = L.geoJSON(geometry, {
+                style: { color: '#0d6efd', weight: 4, opacity: .75, dashArray: '10,6' }
+            }).addTo(map);
+        } else {
+            routeLayer = L.polyline(
+                caches.map(c => [+c.lat, +c.lng]),
+                { color: '#0d6efd', weight: 3, opacity: .6, dashArray: '6,4' }
+            ).addTo(map);
+        }
+        map.fitBounds(routeLayer.getBounds(), { padding: [40, 40] });
+
+        $('#list-body').html(buildRouteHtml(caches, legs));
+        $('#list-footer').html(
+            '<button id="btn-back-sel" class="btn btn-sm btn-outline-secondary w-100">' +
+            '← Zurück zur Auswahl</button>'
+        );
+    }
+
+    $(document).on('click', '#btn-back-sel', function () {
+        inRouteMode = false;
+        if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+        renderSelectionList();
+        $('#list-footer').html(
+            '<button id="btn-clear-sel" class="btn btn-sm btn-outline-secondary w-100">Auswahl löschen</button>'
+        );
+        updateRouteBtn();
+    });
+
+    function buildRouteHtml(caches, legs) {
+        const allFb   = legs.every(l => l.fallback);
+        const anyFb   = legs.some(l => l.fallback);
+        const total   = legs.reduce((s, l) => s + l.distance, 0);
+        const srcNote = allFb ? '⚠ Luftlinie (Brouter nicht erreichbar)'
+                      : anyFb ? '⚠ Teils Luftlinie (einzelne Abschnitte)'
+                      : '🚶 Fußweg via Brouter (inkl. Feldwege)';
+
+        let h = '<div class="p-2">' +
+            '<div class="route-source-note">' + srcNote + '</div>';
+
+        caches.forEach(function (c, i) {
+            const col = c.color || '#6b7280';
+            const sub = c.isCache === false ? 'Eigener Wegpunkt' : (c.cache_type_name || '');
+            h += '<div class="route-waypoint">' +
+                 '<span class="route-num" style="background:' + col + '">' + (i + 1) + '</span>' +
+                 '<div class="overflow-hidden flex-grow-1">' +
+                   '<div class="small fw-semibold text-truncate">' + escHtml(c.name) + '</div>' +
+                   '<div style="font-size:.71rem;color:#6b7280">' + escHtml(sub) + '</div>' +
+                 '</div></div>';
+            if (legs[i]) {
+                h += '<div class="route-leg-dist">' + fmtDist(legs[i].distance) + '</div>';
+            }
+        });
+
+        h += '<div class="route-total">Gesamt: <strong>' + fmtDist(total) + '</strong></div></div>';
+        return h;
+    }
+
+    function fmtDist(m) {
+        return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m';
+    }
+
+    function hvDist(a, b) {
+        const R = 6371000, r = d => d * Math.PI / 180;
+        const f1 = r(+a.lat), f2 = r(+b.lat);
+        const df = r(+b.lat - +a.lat), dl = r(+b.lng - +a.lng);
+        const x  = Math.sin(df / 2) ** 2 + Math.cos(f1) * Math.cos(f2) * Math.sin(dl / 2) ** 2;
+        return 2 * R * Math.asin(Math.sqrt(x));
+    }
+
+    // ── Mouse position control ────────────────────────────────────────────────
+    function toDDM(lat, lng) {
+        const latH = lat >= 0 ? 'N' : 'S';
+        const lngH = lng >= 0 ? 'E' : 'W';
+        const aLat = Math.abs(lat), aLng = Math.abs(lng);
+        const dLat = Math.floor(aLat), dLng = Math.floor(aLng);
+        const mLat = (aLat - dLat) * 60, mLng = (aLng - dLng) * 60;
+        const fmt = (d, pad, m) => {
+            const wi = Math.floor(m);
+            const fr = String(Math.round((m - wi) * 1000)).padStart(3, '0');
+            return String(d).padStart(pad, '0') + '°' + String(wi).padStart(2, '0') + '.' + fr;
+        };
+        return `${latH} ${fmt(dLat, 2, mLat)}  ${lngH} ${fmt(dLng, 3, mLng)}`;
+    }
+
+    const MousePosCtrl = L.Control.extend({
+        onAdd(m) {
+            const el = L.DomUtil.create('div', 'mouse-pos-ctrl');
+            el.innerHTML = '<div>–</div><div></div>';
+            m.on('mousemove', e => {
+                const { lat, lng } = e.latlng;
+                el.children[0].textContent = toDDM(lat, lng);
+                el.children[1].textContent = lat.toFixed(6) + '  /  ' + lng.toFixed(6);
+            });
+            m.on('mouseout', () => {
+                el.children[0].textContent = '–';
+                el.children[1].textContent = '';
+            });
+            return el;
+        }
+    });
+    new MousePosCtrl({ position: 'bottomright' }).addTo(map);
+
+    // ── Rubber-band zoom (view mode, btn-zoom-box) ────────────────────────────
+    const _mapEl = map.getContainer();
+    let _zbActive = false, _zbStart = null, _zbBox = null;
+
+    $('#btn-zoom-box').on('click', function () {
+        _zbActive = !_zbActive;
+        $(this).toggleClass('active', _zbActive);
+        _mapEl.style.cursor = _zbActive ? 'crosshair' : '';
+    });
+
+    _mapEl.addEventListener('mousedown', function (e) {
+        if (!_zbActive || e.button !== 0 || drawMode !== 'view') return;
+        e.stopPropagation();
+        e.preventDefault();
+        const r = _mapEl.getBoundingClientRect();
+        _zbStart = { x: e.clientX - r.left, y: e.clientY - r.top };
+        _zbBox = document.createElement('div');
+        Object.assign(_zbBox.style, {
+            position: 'absolute', border: '2px dashed #0d6efd',
+            background: 'rgba(13,110,253,.08)', pointerEvents: 'none',
+            zIndex: 900, left: _zbStart.x + 'px', top: _zbStart.y + 'px', width: '0', height: '0',
+        });
+        _mapEl.appendChild(_zbBox);
+        document.addEventListener('mousemove', _zbMove);
+        document.addEventListener('mouseup', _zbEnd, { once: true });
+    }, true);
+
+    function _zbMove(e) {
+        if (!_zbBox || !_zbStart) return;
+        const r = _mapEl.getBoundingClientRect();
+        const cx = e.clientX - r.left, cy = e.clientY - r.top;
+        Object.assign(_zbBox.style, {
+            left: Math.min(_zbStart.x, cx) + 'px', top:    Math.min(_zbStart.y, cy) + 'px',
+            width: Math.abs(cx - _zbStart.x) + 'px', height: Math.abs(cy - _zbStart.y) + 'px',
+        });
+    }
+
+    function _zbEnd(e) {
+        document.removeEventListener('mousemove', _zbMove);
+        if (!_zbBox || !_zbStart) return;
+        const r = _mapEl.getBoundingClientRect();
+        const cx = e.clientX - r.left, cy = e.clientY - r.top;
+        _mapEl.removeChild(_zbBox); _zbBox = null;
+        const x1 = Math.min(_zbStart.x, cx), y1 = Math.min(_zbStart.y, cy);
+        const x2 = Math.max(_zbStart.x, cx), y2 = Math.max(_zbStart.y, cy);
+        _zbStart = null;
+        if (x2 - x1 > 10 && y2 - y1 > 10) {
+            skipNextDbLoad = true;
+            map.fitBounds([map.containerPointToLatLng([x1, y2]), map.containerPointToLatLng([x2, y1])]);
+        }
+        _zbActive = false;
+        $('#btn-zoom-box').removeClass('active');
+        _mapEl.style.cursor = '';
+    }
+
+    // ── Utilities ─────────────────────────────────────────────────────────────
+    function escHtml(s) {
+        return String(s ?? '').replace(/[&<>"]/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+        }[c]));
+    }
+
+    function strip300(html) {
+        const text = (html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        return text.slice(0, 300);
+    }
+
+    function rot13(s) {
+        return String(s).replace(/[a-zA-Z]/g, c => {
+            const b = c <= 'Z' ? 65 : 97;
+            return String.fromCharCode(((c.charCodeAt(0) - b + 13) % 26) + b);
+        });
+    }
+
+    function spinnerHtml(msg) {
+        return `<div class="d-flex align-items-center gap-2 p-3 text-muted">
+            <div class="spinner-border spinner-border-sm"></div><span>${msg}</span></div>`;
+    }
+    function spinnerSmall() {
+        return '<span class="spinner-border spinner-border-sm"></span>';
+    }
+    function alertHtml(msg, type) {
+        return `<div class="alert alert-${type} m-3">${escHtml(msg)}</div>`;
+    }
+});

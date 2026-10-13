@@ -1,0 +1,15 @@
+# Lokale Konfiguration: nur die sichere Vorlage und der Webserver-Schutz
+# werden versioniert; lokale Konfigurationsdateien bleiben privat.
+/config/*
+!/config/.htaccess
+!/config/credentials.example.php
+/config/credentials.php
+/config/credentials.php~
+/session/cookies.txt
+
+# Lokale Geocache-Datenbank und SQLite-Dateien
+/data/*.sqlite
+/data/*.sqlite-*
+
+# Lokale Agent-/Editor-Einstellungen
+/.claude/settings.local.json
