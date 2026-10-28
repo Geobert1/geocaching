@@ -104,7 +104,7 @@ try {
             'difficulty'        => (float)($item['difficulty'] ?? 1.0),
             'terrain'           => (float)($item['terrain']    ?? 1.0),
             'container_size'    => $containerName,
-            'status'            => GeocachingClient::mapStatus((int)($item['cacheStatus'] ?? 0)),
+            'status'            => GeocachingClient::mapStatus($item['cacheStatus'] ?? 0),
             'lat'               => $lat,
             'lng'               => $lng,
             'owner'             => is_array($owner) ? ($owner['username'] ?? null) : $owner,
@@ -123,38 +123,74 @@ try {
     $db->logSyncArea($areaParams);
     $db->cleanSyncLog($maxAge);
 
-    // ── Found-Sync (max. einmal pro maxAge-Zeitraum) ──────────────────────────
+    // ── Found-Sync for this area (paginate so older finds are included) ───────
     $foundCount = 0;
     $foundError = null;
-    $foundSkipped = false;
-    $foundSyncAge = $db->foundSyncAge();
-    $maxAgeSecs   = $maxAge * 3600;
-
-    if (!$force && $foundSyncAge !== null && $foundSyncAge < $maxAgeSecs) {
-        $foundSkipped = true;
-    } else {
-        try {
-            $foundItems = $client->getFoundCacheCodes();
-            $db->clearAllFoundStatuses();
-            foreach ($foundItems as $item) {
-                $db->setFoundStatus($item['gc_code'], $item['found_date']);
-                $foundCount++;
-            }
-            $db->logFoundSync();
-        } catch (Throwable $e) {
-            $foundError = $e->getMessage();
+    try {
+        $foundItems = [];
+        $take = 200;
+        for ($page = 0; $page < 25; $page++) {
+            $foundData = $client->searchFoundInArea($areaParams, $page * $take, $take);
+            $pageItems = $foundData['results'] ?? [];
+            if ($pageItems) array_push($foundItems, ...$pageItems);
+            if (count($pageItems) < $take) break;
         }
+
+        // Only an explicit personal found date is evidence of a find. The web
+        // search endpoint can return ordinary area results even when its found
+        // filter is ignored, so never mark every returned item blindly.
+        if ($mode === 'circle') {
+            $latDelta = $areaParams['radius'] / 111_000;
+            $lngDelta = $areaParams['radius'] / max(1, 111_000 * cos(deg2rad($areaParams['lat'])));
+            $south = $areaParams['lat'] - $latDelta;
+            $north = $areaParams['lat'] + $latDelta;
+            $west = $areaParams['lng'] - $lngDelta;
+            $east = $areaParams['lng'] + $lngDelta;
+            $areaCaches = array_filter(
+                $db->getCachesInBBox($south, $west, $north, $east),
+                static function (array $cache) use ($areaParams): bool {
+                    $lat1 = deg2rad($areaParams['lat']);
+                    $lat2 = deg2rad((float)$cache['lat']);
+                    $dLat = $lat2 - $lat1;
+                    $dLng = deg2rad((float)$cache['lng'] - $areaParams['lng']);
+                    $a = sin($dLat / 2) ** 2 + cos($lat1) * cos($lat2) * sin($dLng / 2) ** 2;
+                    return 6_371_000 * 2 * asin(min(1, sqrt($a))) <= $areaParams['radius'];
+                }
+            );
+        } else {
+            $areaCaches = $db->getCachesInBBox(
+                $areaParams['minLat'], $areaParams['minLng'],
+                $areaParams['maxLat'], $areaParams['maxLng']
+            );
+        }
+        $areaGcCodes = array_column($areaCaches, 'gc_code');
+        $db->clearFoundStatusesForCaches($areaGcCodes);
+        $verifiedFoundCodes = [];
+        foreach (array_merge($results, $foundItems) as $item) {
+            $gcCode = strtoupper((string)($item['code'] ?? $item['referenceCode'] ?? ''));
+            if (!$gcCode) continue;
+            $foundDate = $item['userFoundDate']
+                ?? $item['userData']['foundDate']
+                ?? null;
+            $userFound = in_array($item['userFound'] ?? null, [true, 1, '1', 'true'], true);
+            if (!$userFound && !$foundDate) continue;
+            $foundDate = $foundDate ? substr((string)$foundDate, 0, 10) : null;
+            if ($foundDate !== null && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $foundDate)) $foundDate = null;
+            $db->setFoundStatus($gcCode, $foundDate);
+            $verifiedFoundCodes[$gcCode] = true;
+        }
+        $foundCount = count($verifiedFoundCodes);
+    } catch (Throwable $e) {
+        $foundError = $e->getMessage();
     }
 
     $msg = "{$saved} Caches gespeichert (API: " . ($data['total'] ?? '?') . ")";
     if ($foundError) {
         $msg .= " – Funde-Sync fehlgeschlagen: {$foundError}";
-    } elseif ($foundSkipped) {
-        // found status is still fresh — no extra note needed
     } elseif ($foundCount > 0) {
         $msg .= ", {$foundCount} Funde markiert";
     } else {
-        $msg .= ", keine Funde in DB";
+        $msg .= ", keine gefundenen Caches im Bereich";
     }
     $msg .= '.';
 

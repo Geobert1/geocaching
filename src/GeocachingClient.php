@@ -190,6 +190,7 @@ class GeocachingClient
             'lat'  => number_format($lat, 6, '.', ''),
             'lng'  => number_format($lng, 6, '.', ''),
             'rad'  => $radiusMeters,
+            'sa'   => 1, // Include disabled and archived listings in map search results.
             'skip' => 0,
             'take' => min($take, 200),
             'sort' => 'distance',
@@ -208,6 +209,7 @@ class GeocachingClient
                       number_format($w, 6, '.', '') . ',' .
                       number_format($s, 6, '.', '') . ',' .
                       number_format($e, 6, '.', ''),
+            'sa'   => 1, // Include disabled and archived listings in map search results.
             'skip' => 0,
             'take' => min($take, 200),
             'sort' => 'distance',
@@ -313,12 +315,27 @@ class GeocachingClient
             throw new RuntimeException('Cache-Seite nicht abrufbar: HTTP ' . $r['status']);
         }
         $body = $r['body'];
-        $result = ['encoded_hints' => null, 'short_description' => null, 'long_description' => null, 'log_totals' => []];
+        $result = ['encoded_hints' => null, 'short_description' => null, 'long_description' => null, 'log_totals' => [], 'status' => null];
 
         // Parse HTML with DOMDocument for reliable extraction
         $doc = new \DOMDocument();
         @$doc->loadHTML('<?xml encoding="utf-8"?>' . $body, LIBXML_NOERROR | LIBXML_NOWARNING);
         $xpath = new \DOMXPath($doc);
+
+        // The map search endpoint can retain an outdated cacheStatus value.
+        // Listing status messages are the authoritative status shown to users.
+        if ($xpath->query('//*[@id="ctl00_ContentBody_archivedMessage"]')->length > 0) {
+            $result['status'] = 'archived';
+        } elseif ($xpath->query('//*[@id="ctl00_ContentBody_disabledMessage"]')->length > 0) {
+            $result['status'] = 'disabled';
+        } elseif ($xpath->query('//*[@id="ctl00_ContentBody_lockedMessage"]')->length > 0) {
+            // Locked listings are unavailable to searchers, but are not necessarily archived.
+            $result['status'] = 'disabled';
+        } elseif ($xpath->query('//*[@id="unpublishedMessage" or @id="unpublishedReviewerNoteMessage"]')->length > 0) {
+            $result['status'] = 'disabled';
+        } else {
+            $result['status'] = 'active';
+        }
 
         // Hint: use the LAST element matching "hint" in id — div_hint contains the ROT13 text,
         // while ctl00_ContentBody_hints (earlier in DOM) is just the section header.
@@ -477,9 +494,32 @@ class GeocachingClient
         return $html;
     }
 
-    public static function mapStatus(int $s): string
+    public static function mapStatus(mixed $status): string
     {
-        return match ($s) { 0 => 'active', 1 => 'disabled', 2 => 'archived', default => 'active' };
+        if (is_array($status)) {
+            $status = $status['status'] ?? $status['statusName'] ?? $status['name']
+                ?? $status['statusId'] ?? $status['id'] ?? 0;
+        }
+        if (is_string($status)) {
+            $normalized = strtolower(trim($status));
+            if (str_contains($normalized, 'archiv')) return 'archived';
+            if (str_contains($normalized, 'disabl') || str_contains($normalized, 'deactiv')
+                || str_contains($normalized, 'lock') || str_contains($normalized, 'unpublish')
+                || str_contains($normalized, 'unavailable')) return 'disabled';
+            if (str_contains($normalized, 'active') || str_contains($normalized, 'available')
+                || str_contains($normalized, 'enabled') || str_contains($normalized, 'published')) return 'active';
+            if (!is_numeric($normalized)) return 'active';
+            $status = (int)$normalized;
+        }
+
+        // Search v2 uses 0=active, 1=disabled, 2=archived. Also accept the
+        // remaining official status IDs (3=disabled, 4=locked, 5=archived).
+        return match ((int)$status) {
+            0 => 'active',
+            1, 3, 4 => 'disabled',
+            2, 5 => 'archived',
+            default => 'active',
+        };
     }
 
     public static function typeName(int $id): string

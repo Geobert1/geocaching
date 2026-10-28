@@ -10,6 +10,11 @@ GeocacheMap ist eine lokal betriebene PHP-Webanwendung zum Erkunden und Planen v
 - Cache-Details und Logs abrufen
 - Eigene Wegpunkte und Mystery-Koordinaten verwalten
 - Routen aus Caches und Wegpunkten planen, speichern und exportieren
+- Aktuelle Routenplanung automatisch als gespeicherte Route „Letzte Planung“ sichern und bei Bedarf laden
+- E-Ladesäulen aus OpenStreetMap in der Karte anzeigen
+- ICON-EU-Windvorhersage als zuschaltbare Ebene mit automatischem Fallback auf das gröbere globale ICON-Modell und einer ans Kartenformat angepassten Windpfeil-Matrix mit etwa 300 Punkten
+- Routenkarte als PNG exportieren und eine Nachricht in WhatsApp Web vorbereiten
+- Höhenprofil und OSM-Wegbeschaffenheit für berechnete Routen anzeigen
 - Routenberechnung über OSRM; bei Nichterreichbarkeit wird eine Luftlinienberechnung verwendet
 
 ## Voraussetzungen
@@ -18,6 +23,7 @@ GeocacheMap ist eine lokal betriebene PHP-Webanwendung zum Erkunden und Planen v
 - Ein Webserver oder der eingebaute PHP-Entwicklungsserver
 - Ein geocaching.com-Konto für die Synchronisierung
 - Internetzugang für geocaching.com sowie die verwendeten Karten- und Routing-Dienste
+- Für die Windebene: `wgrib2`, `bzip2` sowie aktiviertes PHP-`proc_open`; die GRIB-Dateien werden vom offenen DWD-Server geladen
 
 Die benötigten Frontend-Bibliotheken liegen bereits im Verzeichnis `assets/`; ein Node.js-Build ist nicht erforderlich.
 
@@ -77,3 +83,7 @@ src/       Datenbank- und geocaching.com-Client
 ## Hinweise
 
 Kartenkacheln und Routing werden von externen Diensten geladen und benötigen eine Internetverbindung. Verfügbarkeit und Nutzungsbedingungen dieser Dienste gelten unabhängig von diesem Projekt. Änderungen an geocaching.com können eine Anpassung des Clients erforderlich machen.
+
+Das Höhenprofil nutzt OpenTopoData mit EU-DEM (25 m Rasterweite) und SRTM (90 m) als Fallback außerhalb der EU-DEM-Abdeckung. Wegtypen und Oberflächen wie `surface`, `tracktype` und `smoothness` werden über OpenStreetMap abgefragt und nahe der berechneten Route zugeordnet; bei Ausfall der primären Overpass-Instanz wird eine Ausweichinstanz genutzt. Die Angaben hängen von der Erfassung in OSM ab; nicht kartierte Wegbeschaffenheit wird nicht geschätzt.
+
+Einkaufsorte und E-Ladesäulen werden bei aktivierten Kartenebenen aus OpenStreetMap über Overpass geladen und im Browser kurzzeitig lokal zwischengespeichert. Die Ladesäulensuche berücksichtigt `amenity=charging_station` und `man_made=charge_point`. Die Abdeckung und Anschlussdetails sind abhängig von den OSM-Beiträgen und daher nicht vollständig oder garantiert aktuell.

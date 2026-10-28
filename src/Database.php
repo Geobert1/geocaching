@@ -68,6 +68,19 @@ class Database
                 synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS parking_data_cache (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                south       REAL NOT NULL,
+                west        REAL NOT NULL,
+                north       REAL NOT NULL,
+                east        REAL NOT NULL,
+                source      TEXT NOT NULL DEFAULT 'OpenStreetMap',
+                elements_json TEXT NOT NULL,
+                saved_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_parking_data_cache_bounds
+                ON parking_data_cache (south, west, north, east, saved_at);
+
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -86,6 +99,9 @@ class Database
                 name       TEXT NOT NULL,
                 points_json TEXT NOT NULL,
                 roundtrip  INTEGER NOT NULL DEFAULT 0,
+                is_last_plan INTEGER NOT NULL DEFAULT 0,
+                distance_m REAL,
+                distance_approximate INTEGER NOT NULL DEFAULT 0,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -109,9 +125,13 @@ class Database
             "ALTER TABLE caches ADD COLUMN found_date TEXT",
             "ALTER TABLE caches ADD COLUMN long_description TEXT",
             "ALTER TABLE saved_routes ADD COLUMN roundtrip INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE saved_routes ADD COLUMN is_last_plan INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE saved_routes ADD COLUMN distance_m REAL",
+            "ALTER TABLE saved_routes ADD COLUMN distance_approximate INTEGER NOT NULL DEFAULT 0",
         ] as $ddl) {
             try { $this->pdo->exec($ddl); } catch (\PDOException) { /* column already exists */ }
         }
+        $this->pdo->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_routes_single_last_plan ON saved_routes(is_last_plan) WHERE is_last_plan = 1');
     }
 
     // ── Area coverage check ────────────────────────────────────────────────────
@@ -158,6 +178,39 @@ class Database
                   ->execute(['ts' => $threshold]);
     }
 
+    /** Return a recent parking-data response whose box covers the requested view. */
+    public function getParkingData(float $south, float $west, float $north, float $east, int $maxAgeHours = 24): ?array
+    {
+        $threshold = date('Y-m-d H:i:s', strtotime("-{$maxAgeHours} hours"));
+        $stmt = $this->pdo->prepare(<<<SQL
+            SELECT source, elements_json, saved_at
+            FROM parking_data_cache
+            WHERE south <= :south AND west <= :west AND north >= :north AND east >= :east
+              AND saved_at >= :threshold
+            ORDER BY saved_at DESC
+            LIMIT 1
+        SQL);
+        $stmt->execute(compact('south', 'west', 'north', 'east') + ['threshold' => $threshold]);
+        $row = $stmt->fetch();
+        if (!$row) return null;
+        $elements = json_decode((string)$row['elements_json'], true);
+        if (!is_array($elements)) return null;
+        return ['source' => (string)$row['source'], 'elements' => $elements, 'saved_at' => (string)$row['saved_at']];
+    }
+
+    public function saveParkingData(float $south, float $west, float $north, float $east, string $source, array $elements): void
+    {
+        $json = json_encode($elements, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+        if (!is_string($json)) return;
+        $stmt = $this->pdo->prepare(<<<SQL
+            INSERT INTO parking_data_cache (south, west, north, east, source, elements_json)
+            VALUES (:south, :west, :north, :east, :source, :elements_json)
+        SQL);
+        $stmt->execute(compact('south', 'west', 'north', 'east', 'source') + ['elements_json' => $json]);
+        $this->pdo->exec("DELETE FROM parking_data_cache WHERE saved_at < datetime('now', '-30 days')");
+        $this->pdo->exec('DELETE FROM parking_data_cache WHERE id NOT IN (SELECT id FROM parking_data_cache ORDER BY saved_at DESC, id DESC LIMIT 100)');
+    }
+
     private function toBBox(array $p): array
     {
         if ($p['mode'] === 'circle') {
@@ -195,9 +248,29 @@ class Database
         )->execute(['sd' => $shortDescription, 'ld' => $longDescription, 'eh' => $encodedHints, 'gc' => $gcCode]);
     }
 
+    public function updateCacheStatus(string $gcCode, ?string $status): void
+    {
+        if (!in_array($status, ['active', 'disabled', 'archived'], true)) return;
+        $this->pdo->prepare('UPDATE caches SET status = :status WHERE gc_code = :gc')
+            ->execute(['status' => $status, 'gc' => $gcCode]);
+    }
+
     public function clearAllFoundStatuses(): void
     {
         $this->pdo->exec("UPDATE caches SET found_by_user = 0, found_date = NULL");
+    }
+
+    /** Clear found flags only for the cache records refreshed in this area sync. */
+    public function clearFoundStatusesForCaches(array $gcCodes): void
+    {
+        $gcCodes = array_values(array_unique(array_filter(array_map(
+            static fn($code): string => strtoupper(trim((string)$code)),
+            $gcCodes,
+        ), static fn(string $code): bool => preg_match('/^GC[A-Z0-9]+$/', $code) === 1)));
+        if (!$gcCodes) return;
+        $placeholders = implode(',', array_fill(0, count($gcCodes), '?'));
+        $this->pdo->prepare("UPDATE caches SET found_by_user = 0, found_date = NULL WHERE gc_code IN ($placeholders)")
+            ->execute($gcCodes);
     }
 
     public function setFoundStatus(string $gcCode, ?string $foundDate): void
@@ -233,7 +306,13 @@ class Database
                 difficulty        = excluded.difficulty,
                 terrain           = excluded.terrain,
                 container_size    = excluded.container_size,
-                status            = excluded.status,
+                -- An archive is terminal unless the authoritative listing page
+                -- explicitly reports a later status change. The area search
+                -- endpoint can lag behind and incorrectly return active.
+                status            = CASE
+                    WHEN caches.status = 'archived' AND excluded.status = 'active' THEN 'archived'
+                    ELSE excluded.status
+                END,
                 lat               = excluded.lat,
                 lng               = excluded.lng,
                 owner             = excluded.owner,
@@ -365,22 +444,41 @@ class Database
 
     public function getSavedRoutes(): array
     {
-        $routes = $this->pdo->query('SELECT id, name, points_json, roundtrip, created_at, updated_at FROM saved_routes ORDER BY name COLLATE NOCASE, id')->fetchAll();
+        $routes = $this->pdo->query('SELECT id, name, points_json, roundtrip, is_last_plan, distance_m, distance_approximate, created_at, updated_at FROM saved_routes ORDER BY is_last_plan DESC, name COLLATE NOCASE, id')->fetchAll();
         foreach ($routes as &$route) {
             $route['id'] = (int)$route['id'];
             $route['roundtrip'] = (bool)$route['roundtrip'];
+            $route['is_last_plan'] = (bool)$route['is_last_plan'];
+            $route['distance_m'] = $route['distance_m'] !== null ? (float)$route['distance_m'] : null;
+            $route['distance_approximate'] = (bool)$route['distance_approximate'];
             $route['points'] = json_decode($route['points_json'], true) ?: [];
             unset($route['points_json']);
         }
         return $routes;
     }
 
-    public function saveRoute(string $name, array $points, bool $roundtrip = false, ?int $id = null): array
+    public function getLastPlanRouteId(): ?int
+    {
+        $id = $this->pdo->query('SELECT id FROM saved_routes WHERE is_last_plan = 1 ORDER BY id LIMIT 1')->fetchColumn();
+        return $id === false ? null : (int)$id;
+    }
+
+    public function isLastPlanRoute(int $id): bool
+    {
+        $stmt = $this->pdo->prepare('SELECT is_last_plan FROM saved_routes WHERE id = ?');
+        $stmt->execute([$id]);
+        return (bool)$stmt->fetchColumn();
+    }
+
+    public function saveRoute(string $name, array $points, bool $roundtrip = false, ?int $id = null, bool $isLastPlan = false, ?float $distanceMeters = null, bool $distanceApproximate = false): array
     {
         $pointsJson = json_encode($points, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         if ($id !== null) {
-            $stmt = $this->pdo->prepare('UPDATE saved_routes SET name = ?, points_json = ?, roundtrip = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?');
-            $stmt->execute([$name, $pointsJson, (int)$roundtrip, $id]);
+            $query = $isLastPlan
+                ? 'UPDATE saved_routes SET name = ?, points_json = ?, roundtrip = ?, is_last_plan = 1, distance_m = ?, distance_approximate = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+                : 'UPDATE saved_routes SET name = ?, points_json = ?, roundtrip = ?, distance_m = ?, distance_approximate = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?';
+            $stmt = $this->pdo->prepare($query);
+            $stmt->execute([$name, $pointsJson, (int)$roundtrip, $distanceMeters, (int)$distanceApproximate, $id]);
             if ($stmt->rowCount() === 0) {
                 $check = $this->pdo->prepare('SELECT id FROM saved_routes WHERE id = ?');
                 $check->execute([$id]);
@@ -388,15 +486,18 @@ class Database
             }
             $routeId = $id;
         } else {
-            $stmt = $this->pdo->prepare('INSERT INTO saved_routes (name, points_json, roundtrip) VALUES (?, ?, ?)');
-            $stmt->execute([$name, $pointsJson, (int)$roundtrip]);
+            $stmt = $this->pdo->prepare('INSERT INTO saved_routes (name, points_json, roundtrip, is_last_plan, distance_m, distance_approximate) VALUES (?, ?, ?, ?, ?, ?)');
+            $stmt->execute([$name, $pointsJson, (int)$roundtrip, (int)$isLastPlan, $distanceMeters, (int)$distanceApproximate]);
             $routeId = (int)$this->pdo->lastInsertId();
         }
-        $stmt = $this->pdo->prepare('SELECT id, name, points_json, roundtrip, created_at, updated_at FROM saved_routes WHERE id = ?');
+        $stmt = $this->pdo->prepare('SELECT id, name, points_json, roundtrip, is_last_plan, distance_m, distance_approximate, created_at, updated_at FROM saved_routes WHERE id = ?');
         $stmt->execute([$routeId]);
         $route = $stmt->fetch();
         $route['id'] = (int)$route['id'];
         $route['roundtrip'] = (bool)$route['roundtrip'];
+        $route['is_last_plan'] = (bool)$route['is_last_plan'];
+        $route['distance_m'] = $route['distance_m'] !== null ? (float)$route['distance_m'] : null;
+        $route['distance_approximate'] = (bool)$route['distance_approximate'];
         $route['points'] = json_decode($route['points_json'], true) ?: [];
         unset($route['points_json']);
         return $route;
@@ -404,7 +505,17 @@ class Database
 
     public function deleteSavedRoute(int $id): bool
     {
+        if ($this->isLastPlanRoute($id)) return false;
         $stmt = $this->pdo->prepare('DELETE FROM saved_routes WHERE id = ?');
+        $stmt->execute([$id]);
+        return $stmt->rowCount() > 0;
+    }
+
+    public function clearLastPlanRoute(): bool
+    {
+        $id = $this->getLastPlanRouteId();
+        if ($id === null) return false;
+        $stmt = $this->pdo->prepare('DELETE FROM saved_routes WHERE id = ? AND is_last_plan = 1');
         $stmt->execute([$id]);
         return $stmt->rowCount() > 0;
     }
@@ -426,6 +537,13 @@ class Database
         $cache['lat'] = $cache['effective_lat'];
         $cache['lng'] = $cache['effective_lng'];
         unset($cache['effective_lat'], $cache['effective_lng']);
+
+        // Search results already include the Geocaching.com attribute list in
+        // raw_json. Expose it as structured data for the cache detail modal.
+        $raw = json_decode((string)($cache['raw_json'] ?? ''), true);
+        $cache['attributes'] = is_array($raw['attributes'] ?? null)
+            ? array_values(array_filter($raw['attributes'], static fn($attribute): bool => is_array($attribute)))
+            : [];
 
         $logStmt = $this->pdo->prepare(
             'SELECT * FROM logs WHERE gc_code = ? ORDER BY log_date DESC LIMIT 10'

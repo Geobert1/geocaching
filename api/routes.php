@@ -15,8 +15,13 @@ try {
     $payload = json_decode(file_get_contents('php://input'), true);
     if (!is_array($payload)) throw new InvalidArgumentException('Ungültige Anfrage.');
     if ($method === 'DELETE') {
+        if (!empty($payload['last_plan'])) {
+            echo json_encode(['success' => true, 'deleted' => $db->clearLastPlanRoute()]);
+            exit;
+        }
         $id = filter_var($payload['id'] ?? null, FILTER_VALIDATE_INT);
         if ($id === false || $id < 1) throw new InvalidArgumentException('Ungültige Routen-ID.');
+        if ($db->isLastPlanRoute((int)$id)) throw new InvalidArgumentException('„Letzte Planung“ wird automatisch verwaltet und kann nicht gelöscht werden.');
         echo json_encode(['success' => true, 'deleted' => $db->deleteSavedRoute($id)]);
         exit;
     }
@@ -26,12 +31,27 @@ try {
         exit;
     }
 
-    $name = trim((string)($payload['name'] ?? ''));
+    $isLastPlan = !empty($payload['last_plan']);
+    $name = $isLastPlan ? 'Letzte Planung' : trim((string)($payload['name'] ?? ''));
+    $normalizedName = function_exists('mb_strtolower') ? mb_strtolower($name, 'UTF-8') : strtolower($name);
+    if (!$isLastPlan && $normalizedName === 'letzte planung') {
+        throw new InvalidArgumentException('Der Name „Letzte Planung“ ist für die automatische Planung reserviert.');
+    }
     $nameLength = function_exists('mb_strlen') ? mb_strlen($name, 'UTF-8') : strlen($name);
     if ($name === '' || $nameLength > 120) throw new InvalidArgumentException('Der Routenname muss zwischen 1 und 120 Zeichen lang sein.');
     $points = $payload['points'] ?? null;
-    if (!is_array($points) || count($points) < 2 || count($points) > 100) {
+    if (!is_array($points) || count($points) > 100) {
         throw new InvalidArgumentException('Eine Route muss zwischen 2 und 100 Punkten enthalten.');
+    }
+    if ($isLastPlan && count($points) === 0) {
+        $db->clearLastPlanRoute();
+        echo json_encode(['success' => true, 'cleared' => true]);
+        exit;
+    }
+    if (count($points) < ($isLastPlan ? 1 : 2)) {
+        throw new InvalidArgumentException($isLastPlan
+            ? 'Die letzte Planung muss mindestens einen Punkt enthalten.'
+            : 'Eine Route muss zwischen 2 und 100 Punkten enthalten.');
     }
     $normalized = [];
     foreach ($points as $point) {
@@ -56,11 +76,24 @@ try {
         ];
     }
     $id = null;
-    if (array_key_exists('id', $payload) && $payload['id'] !== null && $payload['id'] !== '') {
+    $distanceMeters = null;
+    $distanceApproximate = false;
+    if (!$isLastPlan && array_key_exists('distance_m', $payload) && $payload['distance_m'] !== null && $payload['distance_m'] !== '') {
+        $validatedDistance = filter_var($payload['distance_m'], FILTER_VALIDATE_FLOAT);
+        if ($validatedDistance === false || !is_finite((float)$validatedDistance) || (float)$validatedDistance < 0) {
+            throw new InvalidArgumentException('Ungültige Routenlänge.');
+        }
+        $distanceMeters = (float)$validatedDistance;
+        $distanceApproximate = !empty($payload['distance_approximate']);
+    }
+    if ($isLastPlan) {
+        $id = $db->getLastPlanRouteId();
+    } elseif (array_key_exists('id', $payload) && $payload['id'] !== null && $payload['id'] !== '') {
         $id = filter_var($payload['id'], FILTER_VALIDATE_INT);
         if ($id === false || $id < 1) throw new InvalidArgumentException('Ungültige Routen-ID.');
+        if ($db->isLastPlanRoute((int)$id)) throw new InvalidArgumentException('„Letzte Planung“ wird automatisch verwaltet.');
     }
-    $route = $db->saveRoute($name, $normalized, !empty($payload['roundtrip']), $id);
+    $route = $db->saveRoute($name, $normalized, !empty($payload['roundtrip']), $id, $isLastPlan, $distanceMeters, $distanceApproximate);
     if (!$route) {
         http_response_code(404);
         echo json_encode(['success' => false, 'error' => 'Gespeicherte Route nicht gefunden.']);

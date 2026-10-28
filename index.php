@@ -26,7 +26,7 @@ if (file_exists($credFile)) {
   <link rel="stylesheet" href="assets/css/MarkerCluster.Default.css">
 
   <!-- App -->
-  <link rel="stylesheet" href="css/app.css?v=39">
+  <link rel="stylesheet" href="css/app.css?v=50">
 </head>
 <body>
 
@@ -92,7 +92,7 @@ if (file_exists($credFile)) {
   </div>
 
   <!-- Route-mode toggle + controls (roundtrip, kilometer labels + calc button) -->
-  <div class="d-flex align-items-center gap-2">
+  <div class="d-flex align-items-center gap-2 text-nowrap">
     <button id="btn-route-mode" class="btn btn-sm btn-outline-success"
             title="Route-Modus: Caches per Klick auf der Karte auswählen">
       <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" fill="currentColor"
@@ -107,14 +107,14 @@ if (file_exists($credFile)) {
       </div>
       <div id="route-km-toggle" class="form-check form-check-inline mb-0 d-none">
         <input class="form-check-input" type="checkbox" id="chk-route-km-labels" checked>
-        <label class="form-check-label text-light small" for="chk-route-km-labels">Zeige Kilometerangabe</label>
+        <label class="form-check-label text-light small" for="chk-route-km-labels" title="Kilometermarkierungen anzeigen">km</label>
       </div>
       <div class="route-action-stack">
-        <button id="btn-calc-route" class="btn btn-sm btn-warning" disabled>
-          Route (<span id="sel-count">0</span>)
+        <button id="btn-calc-route" class="btn btn-sm btn-warning" title="Route berechnen" disabled>
+          Berechnen (<span id="sel-count">0</span>)
         </button>
-        <button id="btn-save-route" class="btn btn-sm btn-outline-light" disabled>Route speichern</button>
-        <button id="btn-saved-routes" class="btn btn-sm btn-outline-light">Gespeicherte Routen</button>
+        <button id="btn-save-route" class="btn btn-sm btn-outline-light" title="Route speichern" disabled>Sichern</button>
+        <button id="btn-saved-routes" class="btn btn-sm btn-outline-light" title="Gespeicherte Routen">Routen</button>
       </div>
     </div>
   </div>
@@ -201,6 +201,12 @@ if (file_exists($credFile)) {
       <button id="btn-map-styles" title="Kartenstil wählen" aria-label="Kartenstil wählen" aria-expanded="false">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1 4.2 5 2l5 2 5-2v9.8L10 14l-5-2-4 2V4.2Zm4-.95L2 4.9v7.6l3-1.5V3.25Zm1 0v7.6l3.5 1.4V4.65L6 3.25Zm4.5 1.4v7.6l3.5-1.5v-7.6l-3.5 1.5Z"/></svg>
       </button>
+      <button id="btn-map-overlays" title="Zusätzliche Kartenebenen" aria-label="Zusätzliche Kartenebenen" aria-expanded="false">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></svg>
+      </button>
+      <button id="btn-map-filters" title="Cache-Arten und Status filtern" aria-label="Cache-Arten und Status filtern" aria-expanded="false">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 5h16l-6.5 7.5V19l-3 1v-7.5L4 5z"/></svg>
+      </button>
       <button id="btn-toggle-cluster" title="Clustering ein-/ausschalten">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
              fill="currentColor">
@@ -227,6 +233,45 @@ if (file_exists($credFile)) {
         <option value="satellite">Satellit</option>
         <option value="hybrid">Hybrid (Satellit + Beschriftung)</option>
       </select>
+    </div>
+    <div id="map-overlay-menu" class="d-none shadow-sm">
+      <div class="small fw-semibold mb-2">Kartenebenen</div>
+      <div class="form-check">
+        <input id="toggle-satellite-layer" class="form-check-input" type="checkbox">
+        <label class="form-check-label small" for="toggle-satellite-layer">Wolken-Satellitenbild (DWD)</label>
+      </div>
+      <div class="ms-4 mb-1">
+        <label class="small text-muted d-flex justify-content-between" for="satellite-opacity">
+          <span>DWD-Bilddeckkraft</span><span id="satellite-opacity-value">45 %</span>
+        </label>
+        <input id="satellite-opacity" class="form-range mb-0" type="range" min="20" max="80" step="5" value="45" aria-label="Deckkraft des Wolken-Satellitenbilds">
+      </div>
+      <div id="satellite-layer-status" class="small text-muted ms-4 mb-1" aria-live="polite"></div>
+      <div class="form-check">
+        <input id="toggle-radar-layer" class="form-check-input" type="checkbox">
+        <label class="form-check-label small" for="toggle-radar-layer">Niederschlagsradar</label>
+      </div>
+      <div id="radar-layer-status" class="small text-muted ms-4 mb-1" aria-live="polite"></div>
+      <div class="form-check">
+        <input id="toggle-wind-layer" class="form-check-input" type="checkbox">
+        <label class="form-check-label small" for="toggle-wind-layer">Windvorhersage (ICON-EU)</label>
+      </div>
+      <div id="wind-layer-status" class="small text-muted ms-4 mb-1" aria-live="polite"></div>
+      <div class="form-check">
+        <input id="toggle-coordinate-grid" class="form-check-input" type="checkbox">
+        <label class="form-check-label small" for="toggle-coordinate-grid">Koordinatengitter &amp; Ländergrenzen</label>
+      </div>
+      <div id="coordinate-grid-status" class="small text-muted ms-4 mb-1" aria-live="polite"></div>
+      <hr class="my-2">
+      <div class="form-check">
+        <input id="toggle-cache-markers" class="form-check-input" type="checkbox">
+        <label class="form-check-label small" for="toggle-cache-markers">Geocaches anzeigen</label>
+      </div>
+      <div class="form-check">
+        <input id="toggle-parking-layer" class="form-check-input" type="checkbox">
+        <label class="form-check-label small" for="toggle-parking-layer">Parkplätze anzeigen</label>
+      </div>
+      <div id="parking-layer-status" class="small text-muted ms-4 mb-1" aria-live="polite"></div>
       <hr class="my-2">
       <div class="form-check">
         <input id="toggle-shopping-layer" class="form-check-input" type="checkbox">
@@ -243,6 +288,32 @@ if (file_exists($credFile)) {
         </div>
       </div>
       <div id="shopping-layer-status" class="small text-muted mt-1" aria-live="polite"></div>
+      <hr class="my-2">
+      <div class="form-check">
+        <input id="toggle-charging-layer" class="form-check-input" type="checkbox">
+        <label class="form-check-label small" for="toggle-charging-layer">E-Ladesäulen anzeigen</label>
+      </div>
+      <div id="charging-layer-status" class="small text-muted mt-1" aria-live="polite"></div>
+    </div>
+    <div id="map-filter-menu" class="d-none shadow-sm" aria-label="Cache-Filter">
+      <div class="d-flex align-items-center justify-content-between mb-2">
+        <div class="small fw-semibold">Sichtbarkeit</div>
+        <label class="form-check form-switch map-filter-master mb-0">
+          <input id="toggle-map-visibility" class="form-check-input" type="checkbox" role="switch" aria-label="Alle Status und Fundzustände anzeigen">
+        </label>
+      </div>
+      <div class="small fw-semibold text-muted mb-1">Status</div>
+      <div id="map-filter-statuses" class="map-filter-options mb-2"></div>
+      <div class="small fw-semibold text-muted mb-1">Fundstatus</div>
+      <div id="map-filter-found" class="map-filter-options mb-2"></div>
+      <hr class="my-2">
+      <div class="d-flex align-items-center justify-content-between mb-1">
+        <div class="small fw-semibold text-muted">Cache-Arten</div>
+        <label class="form-check form-switch map-filter-master mb-0">
+          <input id="toggle-all-cache-types" class="form-check-input" type="checkbox" role="switch" aria-label="Alle Cache-Arten anzeigen">
+        </label>
+      </div>
+      <div id="map-filter-types" class="map-filter-options"></div>
     </div>
   </div>
 
@@ -299,6 +370,53 @@ if (file_exists($credFile)) {
   </div>
 </div>
 
+<div class="modal fade" id="route-profile-modal" tabindex="-1" aria-labelledby="route-profile-title" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h5 class="modal-title" id="route-profile-title">Streckenprofil</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Schließen"></button>
+      </div>
+      <div class="modal-body">
+        <div id="route-profile-status" class="small text-muted mb-3" aria-live="polite">Profildaten werden geladen …</div>
+        <div id="route-profile-summary" class="route-profile-summary mb-3"></div>
+        <section class="route-profile-elevation mb-4" aria-labelledby="route-profile-elevation-title">
+          <div class="d-flex align-items-baseline justify-content-between flex-wrap gap-2">
+            <h6 id="route-profile-elevation-title" class="fw-semibold mb-0">Höhenprofil</h6>
+            <span id="route-profile-cursor-readout" class="small text-muted">Entlang des Profils bewegen für Streckenhöhe</span>
+          </div>
+          <div id="route-profile-chart" class="route-profile-chart"></div>
+          <div id="route-profile-elevation-source" class="small text-muted"></div>
+        </section>
+        <div class="row g-4">
+          <section class="col-md-6" aria-labelledby="route-profile-waytype-title">
+            <h6 id="route-profile-waytype-title" class="fw-semibold">Wegtypen</h6>
+            <div id="route-profile-waytypes"></div>
+          </section>
+          <section class="col-md-6" aria-labelledby="route-profile-surface-title">
+            <h6 id="route-profile-surface-title" class="fw-semibold">Untergrund</h6>
+            <div id="route-profile-surfaces"></div>
+          </section>
+        </div>
+        <section class="mt-4" aria-labelledby="route-profile-condition-title">
+          <h6 id="route-profile-condition-title" class="fw-semibold">Wegzustand laut OSM</h6>
+          <div class="row g-4">
+            <div class="col-md-6"><div class="small text-muted mb-2">Festigkeit (tracktype)</div><div id="route-profile-tracktypes"></div></div>
+            <div class="col-md-6"><div class="small text-muted mb-2">Befahrbarkeit (smoothness)</div><div id="route-profile-smoothness"></div></div>
+          </div>
+        </section>
+        <p class="small text-muted mt-3 mb-0">
+          Höhen basieren auf EU-DEM (25 m), mit SRTM (90 m) als Fallback. Wegtypen und Untergrund stammen aus OpenStreetMap und werden nahe der Route zugeordnet; nicht erfasste Angaben werden als unbekannt ausgewiesen.
+          <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap-Mitwirkende</a> · Höhen: <a href="https://www.opentopodata.org/" target="_blank" rel="noopener">OpenTopoData · EU-DEM (EEA) / SRTM</a>.
+        </p>
+      </div>
+      <div class="modal-footer py-1">
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Schließen</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="modal fade" id="gpx-import-help-modal" tabindex="-1" aria-labelledby="gpx-import-help-title" aria-hidden="true">
   <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content">
@@ -337,6 +455,7 @@ if (file_exists($credFile)) {
       </div>
       <div class="modal-footer py-2">
         <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Abbrechen</button>
+        <button id="route-save-new" type="submit" class="btn btn-sm btn-outline-primary d-none">Als neue Route speichern</button>
         <button id="route-name-submit" type="submit" class="btn btn-sm btn-success">Speichern</button>
       </div>
     </form>
@@ -423,7 +542,7 @@ if (file_exists($credFile)) {
 <script src="assets/js/leaflet.js"></script>
 <script src="assets/js/leaflet.draw.min.js"></script>
 <script src="assets/js/leaflet.markercluster.js"></script>
-<script src="js/app.js?v=124"></script>
+<script src="js/app.js?v=159"></script>
 
 </body>
 </html>

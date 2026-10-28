@@ -399,13 +399,29 @@ $(function () {
     const saved  = LS.get('map', null);
     const map = L.map('map', { zoomControl: false, keyboard: false })
         .setView(saved ? [saved.lat, saved.lng] : [54.75, 9.5], saved ? saved.zoom : 12);
+    map.createPane('coordinateGridPane');
+    map.getPane('coordinateGridPane').style.zIndex = 450;
     const mapElement = map.getContainer();
     mapElement.setAttribute('tabindex', '0');
     mapElement.setAttribute('aria-label', 'Karte. Plus und Minus zoomen, Pfeiltasten verschieben die Karte.');
     let pointerPosition = null;
-    document.addEventListener('mousemove', event => {
+    document.addEventListener('pointermove', event => {
         pointerPosition = { x: event.clientX, y: event.clientY };
     });
+    function zoomMapAtPointer(delta, recenter = false) {
+        const rect = mapElement.getBoundingClientRect();
+        const pointerIsOverMap = pointerPosition && pointerPosition.x >= rect.left && pointerPosition.x <= rect.right &&
+            pointerPosition.y >= rect.top && pointerPosition.y <= rect.bottom;
+        const point = pointerIsOverMap
+            ? L.point(pointerPosition.x - rect.left, pointerPosition.y - rect.top)
+            : map.getSize().divideBy(2);
+        const zoom = map.getZoom() + delta;
+        if (recenter && pointerIsOverMap) {
+            map.setView(map.containerPointToLatLng(point), zoom);
+        } else {
+            map.setZoomAround(point, zoom);
+        }
+    }
     $(document).on('keydown', function (event) {
         const target = event.target;
         const rect = mapElement.getBoundingClientRect();
@@ -414,12 +430,12 @@ $(function () {
         const editingText = target?.matches('input, textarea, select, [contenteditable="true"]');
         if (editingText || $(target).closest('.modal.show').length || !(pointerOverMap || target === mapElement)) return;
 
-        if (event.key === '+' || event.key === '=' || event.code === 'NumpadAdd') {
+        if (event.key === '+' || event.key === '*' || event.key === '=' || event.code === 'NumpadAdd') {
             event.preventDefault();
-            map.zoomIn();
+            zoomMapAtPointer(1, event.shiftKey);
         } else if (event.key === '-' || event.key === '_' || event.code === 'NumpadSubtract') {
             event.preventDefault();
-            map.zoomOut();
+            zoomMapAtPointer(-1, event.shiftKey);
         } else {
             const pan = {
                 ArrowLeft: [-80, 0], ArrowRight: [80, 0],
@@ -438,7 +454,18 @@ $(function () {
             $('#distance-from').val(`${center.lat.toFixed(6)} ${center.lng.toFixed(6)}`);
         }
     });
+    function hideSidePanelsOnMapClick() {
+        if (!routeSelectMode && !inRouteMode && $('#list-panel').hasClass('panel-open')) setPanelOpen(false);
+        if ($('#sidebar').hasClass('sidebar-open')) closeSidebar();
+    }
+    function closeAdditionalMapMenus() {
+        $('#map-style-menu, #map-overlay-menu, #map-filter-menu').addClass('d-none');
+        $('#btn-map-styles, #btn-map-overlays, #btn-map-filters')
+            .removeClass('active').attr('aria-expanded', 'false');
+    }
     map.on('click', function (event) {
+        hideSidePanelsOnMapClick();
+        closeAdditionalMapMenus();
         if (waypointPickMode) {
             event.distanceTargetPickHandled = true;
             waypointPickMode = false;
@@ -526,16 +553,395 @@ $(function () {
     }
     applyMapStyle(mapStyle);
 
+    ['map-ctrl-col', 'map-style-menu', 'map-overlay-menu', 'map-filter-menu'].forEach(id => {
+        const element = document.getElementById(id);
+        if (element) L.DomEvent.disableClickPropagation(element);
+    });
+    const mapMenuAnchors = [
+        ['#map-style-menu', '#btn-map-styles'],
+        ['#map-overlay-menu', '#btn-map-overlays'],
+        ['#map-filter-menu', '#btn-map-filters'],
+    ];
+    function positionMapMenu(menuSelector, buttonSelector) {
+        const menu = document.querySelector(menuSelector);
+        const button = document.querySelector(buttonSelector);
+        if (!menu || !button || menu.classList.contains('d-none')) return;
+        const buttonRect = button.getBoundingClientRect();
+        const menuRect = menu.getBoundingClientRect();
+        const left = Math.min(buttonRect.right + 8, window.innerWidth - menuRect.width - 8);
+        const top = Math.max(8, Math.min(buttonRect.top, window.innerHeight - menuRect.height - 8));
+        menu.style.left = `${Math.max(8, left)}px`;
+        menu.style.top = `${top}px`;
+    }
+    function positionOpenMapMenus() {
+        mapMenuAnchors.forEach(([menu, button]) => positionMapMenu(menu, button));
+    }
+
     $('#btn-map-styles').on('click', function () {
         const open = $('#map-style-menu').hasClass('d-none');
         $('#map-style-menu').toggleClass('d-none', !open);
+        $('#map-overlay-menu').addClass('d-none');
+        $('#map-filter-menu').addClass('d-none');
+        $('#btn-map-overlays').removeClass('active').attr('aria-expanded', 'false');
+        $('#btn-map-filters').removeClass('active').attr('aria-expanded', 'false');
         $(this).toggleClass('active', open).attr('aria-expanded', String(open));
+        if (open) positionMapMenu('#map-style-menu', '#btn-map-styles');
+    });
+    $('#btn-map-overlays').on('click', function () {
+        const open = $('#map-overlay-menu').hasClass('d-none');
+        $('#map-overlay-menu').toggleClass('d-none', !open);
+        $('#map-style-menu').addClass('d-none');
+        $('#map-filter-menu').addClass('d-none');
+        $('#btn-map-styles').removeClass('active').attr('aria-expanded', 'false');
+        $('#btn-map-filters').removeClass('active').attr('aria-expanded', 'false');
+        $(this).toggleClass('active', open).attr('aria-expanded', String(open));
+        if (open) positionMapMenu('#map-overlay-menu', '#btn-map-overlays');
     });
     $('#map-style-select').on('change', function () {
         mapStyle = this.value;
         if (!mapStyles[mapStyle]) return;
         applyMapStyle(mapStyle);
         LS.set('mapStyle', mapStyle);
+    });
+
+    // ── Optional imagery and weather layers ─────────────────────────────────
+    const satelliteAttribution = 'Wolken-Satellitenbild © <a href="https://www.dwd.de/DE/leistungen/geodienste/geodienste.html">Deutscher Wetterdienst (DWD)</a>';
+    let satelliteLayerEnabled = false;
+    let satelliteLayer = null;
+    let satelliteOpacity = Math.min(80, Math.max(20, Number(LS.get('satelliteOpacity', 45)) || 45));
+    $('#satellite-opacity').val(satelliteOpacity);
+    $('#satellite-opacity-value').text(`${satelliteOpacity} %`);
+    $('#satellite-opacity').on('input', function () {
+        satelliteOpacity = Math.min(80, Math.max(20, Number(this.value) || 45));
+        $('#satellite-opacity-value').text(`${satelliteOpacity} %`);
+        LS.set('satelliteOpacity', satelliteOpacity);
+        satelliteLayer?.setOpacity(satelliteOpacity / 100);
+    });
+    function setSatelliteLayerEnabled(enabled) {
+        satelliteLayerEnabled = enabled;
+        $('#toggle-satellite-layer').prop('checked', enabled);
+        LS.set('satelliteOverlay', enabled);
+        if (enabled) {
+            satelliteLayer = L.tileLayer.wms('api/satellite.php', {
+                layers: 'SAT_EU_central_RGB_cloud',
+                format: 'image/png', transparent: true, version: '1.1.1',
+                opacity: satelliteOpacity / 100, maxZoom: 19, zIndex: 6,
+                updateWhenIdle: true, updateWhenZooming: false, keepBuffer: 1,
+                attribution: satelliteAttribution,
+            });
+            satelliteLayer.on('loading', () => $('#satellite-layer-status').text('DWD-Wolkenbild wird geladen …'));
+            satelliteLayer.on('load', () => $('#satellite-layer-status').text('DWD-Meteosat · Wolkenbild geladen.'));
+            satelliteLayer.on('tileerror', () => $('#satellite-layer-status').text('DWD-Wolkenbild über den Server nicht erreichbar.'));
+            satelliteLayer.addTo(map);
+            map.attributionControl?.addAttribution(satelliteAttribution);
+        } else {
+            if (satelliteLayer) { map.removeLayer(satelliteLayer); satelliteLayer = null; }
+            map.attributionControl?.removeAttribution(satelliteAttribution);
+            $('#satellite-layer-status').text('');
+        }
+    }
+    $('#toggle-satellite-layer').prop('checked', satelliteLayerEnabled);
+    if (LS.get('satelliteOverlay', false)) setSatelliteLayerEnabled(true);
+    $('#toggle-satellite-layer').on('change', function () {
+        setSatelliteLayerEnabled(this.checked);
+    });
+
+    const radarEnabled = LS.get('radarLayer', false);
+    let radarLayer = null;
+    let radarRefreshTimer = null;
+    let radarRequestId = 0;
+    $('#toggle-radar-layer').prop('checked', radarEnabled);
+    async function refreshRadarLayer() {
+        if (!$('#toggle-radar-layer').prop('checked')) return;
+        const requestId = ++radarRequestId;
+        $('#radar-layer-status').text('Radardaten werden geladen …');
+        try {
+            const response = await fetch('https://api.rainviewer.com/public/weather-maps.json', { cache: 'no-store' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const manifest = await response.json();
+            const frame = manifest.radar?.past?.at(-1);
+            if (!manifest.host || !frame?.path) throw new Error('Kein aktuelles Radarbild verfügbar.');
+            if (requestId !== radarRequestId || !$('#toggle-radar-layer').prop('checked')) return;
+            if (radarLayer) map.removeLayer(radarLayer);
+            radarLayer = L.tileLayer(`${manifest.host}${frame.path}/256/{z}/{x}/{y}/2/0_0.png`, {
+                attribution: 'Wetterradar © <a href="https://www.rainviewer.com/">RainViewer</a>',
+                maxNativeZoom: 7, maxZoom: 19, opacity: 0.68, zIndex: 7,
+                crossOrigin: 'anonymous', updateWhenIdle: true,
+            }).addTo(map);
+            map.attributionControl?.addAttribution('Wetterradar © <a href="https://www.rainviewer.com/">RainViewer</a>');
+            const frameTime = new Date(Number(frame.time) * 1000).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+            $('#radar-layer-status').text(`RainViewer · Bildzeit ${frameTime} · Aktualisierung alle 5 Min.`);
+        } catch (error) {
+            if (requestId === radarRequestId) $('#radar-layer-status').text(`Radarbild nicht erreichbar: ${error.message || 'Verbindungsfehler'}`);
+        } finally {
+            clearTimeout(radarRefreshTimer);
+            if ($('#toggle-radar-layer').prop('checked')) radarRefreshTimer = setTimeout(refreshRadarLayer, 5 * 60 * 1000);
+        }
+    }
+    $('#toggle-radar-layer').on('change', function () {
+        LS.set('radarLayer', this.checked);
+        if (this.checked) {
+            map.attributionControl?.addAttribution('Wetterradar © <a href="https://www.rainviewer.com/">RainViewer</a>');
+            refreshRadarLayer();
+        } else {
+            radarRequestId++;
+            clearTimeout(radarRefreshTimer);
+            if (radarLayer) { map.removeLayer(radarLayer); radarLayer = null; }
+            map.attributionControl?.removeAttribution('Wetterradar © <a href="https://www.rainviewer.com/">RainViewer</a>');
+            $('#radar-layer-status').text('');
+        }
+    });
+    if (radarEnabled) {
+        map.attributionControl?.addAttribution('Wetterradar © <a href="https://www.rainviewer.com/">RainViewer</a>');
+        refreshRadarLayer();
+    }
+
+    // ── ICON-EU 10 m wind vectors ────────────────────────────────────────────
+    const windAttribution = 'Windmodell ICON-EU © <a href="https://www.dwd.de/">Deutscher Wetterdienst</a>';
+    const windPane = map.createPane('windVectorsPane');
+    windPane.style.zIndex = '650';
+    windPane.style.pointerEvents = 'auto';
+    const windLayer = L.layerGroup([], { pane: 'windVectorsPane' });
+    let windRequestId = 0;
+    let windRefreshTimer = null;
+    let windAbortController = null;
+    const windModelControl = L.control({ position: 'bottomleft' });
+    let windModelControlElement = null;
+    windModelControl.onAdd = () => {
+        windModelControlElement = L.DomUtil.create('div', 'wind-model-control d-none');
+        L.DomEvent.disableClickPropagation(windModelControlElement);
+        L.DomEvent.disableScrollPropagation(windModelControlElement);
+        return windModelControlElement;
+    };
+    windModelControl.addTo(map);
+    $('#toggle-wind-layer').prop('checked', LS.get('windLayer', false));
+    function updateWindModelControl(data) {
+        if (!windModelControlElement) return;
+        const match = String(data.run || '').match(/^(\d{4})(\d{2})(\d{2})(\d{2})$/);
+        const runLabel = match ? `${match[1]}-${match[2]}-${match[3]} ${match[4]}Z` : 'unbekannter Lauf';
+        const forecastHour = String(Number(data.forecastHour) || 0).padStart(2, '0');
+        windModelControlElement.innerHTML = `<strong>${data.model || 'ICON-EU'}</strong><span>Lauf ${runLabel} · H+${forecastHour}</span>`;
+        windModelControlElement.classList.remove('d-none');
+    }
+    function windDescription(point) {
+        const speedKmh = point.speed * 3.6;
+        const speedKnots = point.speed * 1.943844;
+        const degrees = (Math.round(point.bearing) + 360) % 360;
+        const compassPoints = ['N', 'NNO', 'NO', 'ONO', 'O', 'OSO', 'SO', 'SSO', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+        const compass = compassPoints[Math.round(degrees / 22.5) % 16];
+        return `${speedKmh.toFixed(1)} km/h · ${point.speed.toFixed(1)} m/s · ${speedKnots.toFixed(1)} kt · weht nach ${degrees}° (${compass})`;
+    }
+    function windBarbSvg(point) {
+        const windDirection = (point.bearing + 180) % 360;
+        const speedKmh = point.speed * 3.6;
+        const lengthScale = Math.min(1.55, Math.max(0.75, 0.75 + speedKmh / 100 * 0.8));
+        let knots = Math.round(point.speed * 1.943844 / 5) * 5;
+        const marks = [];
+        while (knots >= 50) { marks.push('pennant'); knots -= 50; }
+        while (knots >= 10) { marks.push('full'); knots -= 10; }
+        if (knots >= 5) marks.push('half');
+        if (!marks.length) {
+            return `<svg class="wind-barb-svg" viewBox="0 0 88 88" role="img" aria-label="Windstille"><circle cx="44" cy="44" r="5" fill="#123653" stroke="#fff" stroke-width="2.5"/></svg>`;
+        }
+        // Lay out marks from the outer end of the staff toward the station.
+        // Each barb projects perpendicular to the staff.
+        let y = 15;
+        let feathers = '';
+        let featherOutlines = '';
+        for (const mark of marks) {
+            if (mark === 'pennant') {
+                const d = `M44 ${y} L59 ${y + 7} L44 ${y + 14} Z`;
+                feathers += `<path class="wind-barb-filled" d="${d}"/>`;
+                featherOutlines += `<path class="wind-barb-outline" d="${d}"/>`;
+                y += 14;
+            } else if (mark === 'full') {
+                const d = `M44 ${y} L58 ${y}`;
+                feathers += `<path class="wind-barb-line" d="${d}"/>`;
+                featherOutlines += `<path class="wind-barb-outline" d="${d}"/>`;
+                y += 6;
+            } else {
+                const d = `M44 ${y} L51 ${y}`;
+                feathers += `<path class="wind-barb-line" d="${d}"/>`;
+                featherOutlines += `<path class="wind-barb-outline" d="${d}"/>`;
+            }
+        }
+        return `<svg class="wind-barb-svg" viewBox="0 0 88 88" role="img" aria-label="${windDescription(point)}"><g transform="translate(44 44) rotate(${windDirection}) scale(1 ${lengthScale}) translate(-44 -44)"><path class="wind-barb-outline" d="M44 44 L44 13"/>${featherOutlines}<path class="wind-barb-staff" d="M44 44 L44 13"/>${feathers}</g></svg>`;
+    }
+    function scheduleWindRefresh(delay = 350) {
+        clearTimeout(windRefreshTimer);
+        windRefreshTimer = setTimeout(refreshWindLayer, delay);
+    }
+    async function refreshWindLayer() {
+        if (!$('#toggle-wind-layer').prop('checked')) return;
+        const requestId = ++windRequestId;
+        windAbortController?.abort();
+        windAbortController = new AbortController();
+        const bounds = map.getBounds();
+        const params = new URLSearchParams({
+            w: bounds.getWest().toFixed(5), s: bounds.getSouth().toFixed(5),
+            e: bounds.getEast().toFixed(5), n: bounds.getNorth().toFixed(5),
+        });
+        if (windModelControlElement) {
+            windModelControlElement.textContent = 'Windmodell wird geladen …';
+            windModelControlElement.classList.remove('d-none');
+        }
+        $('#wind-layer-status').text('Winddaten werden geladen (große Ausschnitte mit ICON 13) …');
+        try {
+            const response = await fetch(`api/wind.php?${params}`, { cache: 'no-store', signal: windAbortController.signal });
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(data.error || `HTTP ${response.status}`);
+            if (requestId !== windRequestId || !$('#toggle-wind-layer').prop('checked')) return;
+            windLayer.clearLayers();
+            for (const point of data.points || []) {
+                const marker = L.marker([point.lat, point.lon], {
+                    pane: 'windVectorsPane',
+                    interactive: true,
+                    bubblingMouseEvents: true,
+                    keyboard: false,
+                    icon: L.divIcon({
+                        className: 'wind-vector-icon',
+                        html: windBarbSvg(point),
+                        iconSize: [32, 32], iconAnchor: [16, 16],
+                    }),
+                    title: windDescription(point),
+                });
+                marker.bindTooltip(windDescription(point), { direction: 'top', offset: [0, -8], opacity: 0.95 });
+                windLayer.addLayer(marker);
+            }
+            windLayer.addTo(map);
+            map.attributionControl?.addAttribution(windAttribution);
+            updateWindModelControl(data);
+            const valid = new Date(data.validTime).toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' });
+            $('#wind-layer-status').text(`${data.model} · gültig ${valid} · ${data.points.length} Punkte · Fieder zeigt die Richtung, in die der Wind weht`);
+        } catch (error) {
+            if (error.name === 'AbortError' || requestId !== windRequestId) return;
+            if (windModelControlElement) windModelControlElement.textContent = 'Winddaten nicht verfügbar';
+            $('#wind-layer-status').text(`Winddaten nicht erreichbar: ${error.message || 'Verbindungsfehler'}`);
+        }
+    }
+    $('#toggle-wind-layer').on('change', function () {
+        LS.set('windLayer', this.checked);
+        if (this.checked) {
+            map.attributionControl?.addAttribution(windAttribution);
+            refreshWindLayer();
+        } else {
+            windRequestId++;
+            clearTimeout(windRefreshTimer);
+            windAbortController?.abort();
+            windLayer.clearLayers();
+            if (map.hasLayer(windLayer)) map.removeLayer(windLayer);
+            map.attributionControl?.removeAttribution(windAttribution);
+            windModelControlElement?.classList.add('d-none');
+            $('#wind-layer-status').text('');
+        }
+    });
+    map.on('moveend zoomend', () => {
+        if ($('#toggle-wind-layer').prop('checked')) scheduleWindRefresh();
+    });
+    if ($('#toggle-wind-layer').prop('checked')) {
+        map.attributionControl?.addAttribution(windAttribution);
+        scheduleWindRefresh(0);
+    }
+
+    // ── Coordinate grid, country boundaries and coastlines ──────────────────
+    const contextOverlay = L.layerGroup();
+    const coordinateGrid = L.layerGroup();
+    const boundaryLines = L.layerGroup();
+    contextOverlay.addLayer(coordinateGrid);
+    contextOverlay.addLayer(boundaryLines);
+    const contextAttribution = 'Ländergrenzen und Küsten © <a href="https://www.naturalearthdata.com/">Natural Earth</a>';
+    let boundaryDataPromise = null;
+    let boundaryDataLoaded = false;
+    async function loadBoundaryData() {
+        if (boundaryDataLoaded || boundaryDataPromise) return boundaryDataPromise;
+        $('#coordinate-grid-status').text('Ländergrenzen und Küsten werden geladen …');
+        boundaryDataPromise = Promise.all([
+            fetch('assets/data/ne_50m_admin_0_boundary_lines_land.geojson'),
+            fetch('assets/data/ne_50m_land_coastline.geojson'),
+        ]).then(async ([countryResponse, coastResponse]) => {
+            if (!countryResponse.ok || !coastResponse.ok) throw new Error('Lokale Grenzdaten nicht erreichbar.');
+            const [countries, coastlines] = await Promise.all([countryResponse.json(), coastResponse.json()]);
+            L.geoJSON(coastlines, {
+                pane: 'coordinateGridPane',
+                interactive: false,
+                style: { color: '#b8edff', weight: 1.35, opacity: 0.95 },
+            }).addTo(boundaryLines);
+            L.geoJSON(countries, {
+                pane: 'coordinateGridPane',
+                interactive: false,
+                style: { color: '#ffe28a', weight: 1.5, opacity: 0.95, dashArray: '4 2' },
+            }).addTo(boundaryLines);
+            boundaryDataLoaded = true;
+            $('#coordinate-grid-status').text('Küsten und Ländergrenzen · Natural Earth');
+        }).catch(error => {
+            boundaryDataPromise = null;
+            $('#coordinate-grid-status').text(error.message || 'Grenzdaten konnten nicht geladen werden.');
+        });
+        return boundaryDataPromise;
+    }
+    function gridStep(zoom) {
+        if (zoom < 3) return 30;
+        if (zoom < 5) return 10;
+        if (zoom < 7) return 5;
+        if (zoom < 9) return 2;
+        if (zoom < 11) return 1;
+        if (zoom < 13) return 0.5;
+        if (zoom < 15) return 0.1;
+        return 0.05;
+    }
+    function coordinateLabel(value, axis, step) {
+        const abs = Math.abs(value);
+        const decimals = step >= 1 ? 0 : step >= 0.1 ? 1 : 2;
+        const direction = axis === 'lat' ? (value < 0 ? 'S' : 'N') : (value < 0 ? 'W' : 'E');
+        return `${abs.toFixed(decimals)}°${direction}`;
+    }
+    function updateCoordinateGrid() {
+        if (!map.hasLayer(contextOverlay)) return;
+        coordinateGrid.clearLayers();
+        const bounds = map.getBounds();
+        const south = Math.max(-85, bounds.getSouth()), north = Math.min(85, bounds.getNorth());
+        const west = bounds.getWest(), east = bounds.getEast();
+        const step = gridStep(map.getZoom());
+        const lineStyle = { color: '#fff', weight: 1, opacity: 0.48, dashArray: '4 5', interactive: false, pane: 'coordinateGridPane' };
+        const addLabel = (lat, lng, text) => L.marker([lat, lng], {
+            pane: 'coordinateGridPane',
+            icon: L.divIcon({ className: 'coordinate-grid-label', html: escHtml(text), iconSize: null }),
+            interactive: false, keyboard: false,
+        }).addTo(coordinateGrid);
+
+        for (let lat = Math.ceil(south / step) * step; lat <= north; lat += step) {
+            const value = +lat.toFixed(6);
+            L.polyline([[value, west], [value, east]], lineStyle).addTo(coordinateGrid);
+            addLabel(value, west, coordinateLabel(value, 'lat', step));
+        }
+        for (let lng = Math.ceil(west / step) * step; lng <= east; lng += step) {
+            const value = +lng.toFixed(6);
+            L.polyline([[south, value], [north, value]], lineStyle).addTo(coordinateGrid);
+            addLabel(south, value, coordinateLabel(value, 'lng', step));
+        }
+    }
+    const coordinateGridEnabled = LS.get('coordinateGrid', false);
+    $('#toggle-coordinate-grid').prop('checked', coordinateGridEnabled);
+    if (coordinateGridEnabled) {
+        contextOverlay.addTo(map);
+        map.attributionControl?.addAttribution(contextAttribution);
+        loadBoundaryData();
+    }
+    updateCoordinateGrid();
+    map.on('moveend zoomend resize', updateCoordinateGrid);
+    $('#toggle-coordinate-grid').on('change', function () {
+        LS.set('coordinateGrid', this.checked);
+        if (this.checked) {
+            contextOverlay.addTo(map);
+            map.attributionControl?.addAttribution(contextAttribution);
+            loadBoundaryData();
+            updateCoordinateGrid();
+        } else {
+            coordinateGrid.clearLayers();
+            map.removeLayer(contextOverlay);
+            map.attributionControl?.removeAttribution(contextAttribution);
+            $('#coordinate-grid-status').text('');
+        }
     });
 
     // ── Shopping POI overlay (OpenStreetMap / Overpass API) ─────────────────
@@ -664,7 +1070,6 @@ $(function () {
                 const endpoints = [
                     'https://overpass-api.de/api/interpreter',
                     'https://overpass.private.coffee/api/interpreter',
-                    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
                 ];
                 let data = null;
                 let lastError = null;
@@ -754,6 +1159,345 @@ $(function () {
         shoppingLayer.addTo(map);
         map.attributionControl?.addAttribution('Einkaufsdaten © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>');
         loadShoppingPlaces();
+    }
+
+    // ── Electric vehicle charging overlay (OpenStreetMap / BNetzA fallback) ─
+    const chargingLayer = L.layerGroup();
+    const chargingLayerEnabled = LS.get('chargingLayer', false);
+    let chargingLoadTimer = null;
+    let chargingRequest = null;
+    let chargingRequestId = 0;
+    const chargingCacheKey = 'chargingPoiCacheV2';
+    const chargingCacheTtl = 24 * 60 * 60 * 1000;
+    $('#toggle-charging-layer').prop('checked', chargingLayerEnabled);
+
+    function renderChargingStations(elements, bounds) {
+        chargingLayer.clearLayers();
+        let count = 0;
+        elements.forEach(element => {
+            const lat = element.lat ?? element.center?.lat;
+            const lng = element.lon ?? element.center?.lon;
+            if (!Number.isFinite(+lat) || !Number.isFinite(+lng) || !bounds.contains([+lat, +lng])) return;
+            const tags = element.tags || {};
+            const title = tags.name || tags.operator || 'E-Ladestation';
+            const connectors = Object.entries(tags)
+                .filter(([key, value]) => /^(socket:|charging_station:|charge:)/.test(key) && value)
+                .map(([key, value]) => `${key.replace(/^socket:/, '').replaceAll('_', ' ')}: ${value}`);
+            const details = [
+                tags.operator ? `Betreiber: ${tags.operator}` : '',
+                tags.capacity ? `Ladepunkte: ${tags.capacity}` : '',
+                ...connectors.slice(0, 4),
+            ].filter(Boolean);
+            const icon = L.divIcon({
+                className: 'charging-poi-icon',
+                html: '<span aria-hidden="true">⚡</span>',
+                iconSize: [22, 22], iconAnchor: [11, 11],
+            });
+            L.marker([+lat, +lng], { icon, keyboard: false, bubblingMouseEvents: false })
+                .bindTooltip(`<strong>${escHtml(title)}</strong>${details.length ? `<br>${details.map(escHtml).join('<br>')}` : ''}`, { direction: 'top' })
+                .addTo(chargingLayer);
+            count++;
+        });
+        return count;
+    }
+
+    async function queryChargingBox(box, requestId) {
+        if (requestId !== chargingRequestId) throw new DOMException('Anfrage abgebrochen', 'AbortError');
+        const controller = new AbortController();
+        chargingRequest = controller;
+        const timeoutId = setTimeout(() => controller.abort(), 65000);
+        try {
+            const response = await fetch('api/charging_stations.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ bbox: box }),
+                signal: controller.signal,
+            });
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(data.error || `HTTP ${response.status}`);
+            if (!Array.isArray(data.elements)) throw new Error('Ungültige Antwort vom lokalen Ladesäulen-Endpunkt.');
+            return { elements: data.elements, source: data.source || 'OpenStreetMap' };
+        } catch (error) {
+            if (requestId !== chargingRequestId) throw new DOMException('Anfrage abgebrochen', 'AbortError');
+            if (error.name === 'AbortError') throw new Error('Zeitüberschreitung beim lokalen Ladesäulen-Endpunkt.');
+            throw error;
+        } finally {
+            clearTimeout(timeoutId);
+        }
+    }
+
+    function loadChargingStations() {
+        clearTimeout(chargingLoadTimer);
+        if (!$('#toggle-charging-layer').prop('checked')) return;
+        chargingLoadTimer = setTimeout(async function () {
+            if (map.getZoom() < 12) {
+                $('#charging-layer-status').text('Zum Laden bitte näher heranzoomen (Zoom 12 oder höher).');
+                chargingLayer.clearLayers();
+                return;
+            }
+            const bounds = map.getBounds();
+            const view = { south: bounds.getSouth(), west: bounds.getWest(), north: bounds.getNorth(), east: bounds.getEast() };
+            const now = Date.now();
+            const entries = LS.get(chargingCacheKey, []).filter(entry =>
+                entry && Array.isArray(entry.elements) && now - entry.savedAt < chargingCacheTtl
+            );
+            const cached = entries.find(entry => entry.bbox.south <= view.south && entry.bbox.west <= view.west &&
+                entry.bbox.north >= view.north && entry.bbox.east >= view.east);
+            if (cached) {
+                const count = renderChargingStations(cached.elements, bounds);
+                $('#charging-layer-status').text(`${count} Ladestationen · lokal gespeichert · ${cached.source || 'OpenStreetMap'}`);
+                return;
+            }
+            const step = 0.01;
+            const box = [Math.floor(view.south / step) * step, Math.floor(view.west / step) * step,
+                Math.ceil(view.north / step) * step, Math.ceil(view.east / step) * step];
+            const queryBox = { south: box[0], west: box[1], north: box[2], east: box[3] };
+            const requestId = ++chargingRequestId;
+            chargingRequest?.abort();
+            chargingLayer.clearLayers();
+            $('#charging-layer-status').text('Ladesäulen werden geladen …');
+            try {
+                let elements;
+                let source;
+                let splitQuery = false;
+                try {
+                    const result = await queryChargingBox(box, requestId);
+                    elements = result.elements;
+                    source = result.source;
+                } catch (initialError) {
+                    if (initialError.name === 'AbortError') return;
+                    // Busy public instances often time out on a full viewport.
+                    // Retry as four smaller requests to reduce server work.
+                    $('#charging-layer-status').text('Großer Kartenausschnitt: Ladesäulen werden in Teilbereichen geladen …');
+                    const south = (box[0] + box[2]) / 2;
+                    const west = (box[1] + box[3]) / 2;
+                    const tiles = [
+                        [box[0], box[1], south, west], [box[0], west, south, box[3]],
+                        [south, box[1], box[2], west], [south, west, box[2], box[3]],
+                    ];
+                    elements = [];
+                    for (const tile of tiles) {
+                        const result = await queryChargingBox(tile, requestId);
+                        elements.push(...result.elements);
+                        source = result.source;
+                    }
+                    splitQuery = true;
+                }
+                if (requestId !== chargingRequestId || !$('#toggle-charging-layer').prop('checked')) return;
+                const uniqueElements = [...new Map(elements.map((element, index) => [`${element.type || 'item'}:${element.id ?? index}`, element])).values()];
+                const count = renderChargingStations(uniqueElements, bounds);
+                const keys = ['name', 'operator', 'brand', 'capacity', 'socket:type2', 'socket:type2:output', 'socket:type2_combo', 'socket:type2_combo:output', 'socket:chademo', 'socket:chademo:output', 'socket:ccs', 'socket:ccs:output', 'charging_station:output', 'charge:output'];
+                const compact = uniqueElements.map(element => ({
+                    lat: element.lat ?? null, lon: element.lon ?? null,
+                    center: element.center ? { lat: element.center.lat, lon: element.center.lon } : undefined,
+                    tags: Object.fromEntries(keys.filter(key => element.tags?.[key]).map(key => [key, element.tags[key]])),
+                }));
+                entries.unshift({ savedAt: now, bbox: queryBox, source, elements: compact });
+                LS.set(chargingCacheKey, entries.slice(0, 8));
+                $('#charging-layer-status').text(`${count} Ladestationen · ${source || 'OpenStreetMap'}${splitQuery ? ' · in Teilbereichen geladen' : ''}`);
+            } catch (error) {
+                if (error.name === 'AbortError') return;
+                $('#charging-layer-status').text(`Ladesäulendaten nicht erreichbar: ${error.message || 'Verbindungsfehler'}`);
+            }
+        }, 450);
+    }
+    $('#toggle-charging-layer').on('change', function () {
+        const enabled = this.checked;
+        LS.set('chargingLayer', enabled);
+        if (enabled) {
+            chargingLayer.addTo(map);
+            map.attributionControl?.addAttribution('Ladesäulendaten © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> / <a href="https://www.bundesnetzagentur.de/DE/Fachthemen/ElektrizitaetundGas/E-Mobilitaet/start.html">Bundesnetzagentur</a>');
+            loadChargingStations();
+        } else {
+            clearTimeout(chargingLoadTimer);
+            chargingRequest?.abort();
+            chargingRequestId++;
+            chargingLayer.clearLayers();
+            map.removeLayer(chargingLayer);
+            map.attributionControl?.removeAttribution('Ladesäulendaten © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> / <a href="https://www.bundesnetzagentur.de/DE/Fachthemen/ElektrizitaetundGas/E-Mobilitaet/start.html">Bundesnetzagentur</a>');
+            $('#charging-layer-status').text('');
+        }
+    });
+    map.on('moveend', loadChargingStations);
+    if (chargingLayerEnabled) {
+        chargingLayer.addTo(map);
+        map.attributionControl?.addAttribution('Ladesäulendaten © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> / <a href="https://www.bundesnetzagentur.de/DE/Fachthemen/ElektrizitaetundGas/E-Mobilitaet/start.html">Bundesnetzagentur</a>');
+        loadChargingStations();
+    }
+
+    // ── Parking overlay (OpenStreetMap / Overpass API) ──────────────────────
+    const parkingLayer = L.layerGroup();
+    const parkingLayerEnabled = LS.get('parkingLayer', false);
+    let parkingLoadTimer = null;
+    let parkingRequest = null;
+    let parkingRequestId = 0;
+    const parkingCacheKey = 'parkingPoiCacheV1';
+    const parkingCacheTtl = 24 * 60 * 60 * 1000;
+    $('#toggle-parking-layer').prop('checked', parkingLayerEnabled);
+
+    function renderParkingPlaces(elements, bounds) {
+        parkingLayer.clearLayers();
+        let count = 0;
+        elements.forEach(element => {
+            const lat = element.lat ?? element.center?.lat;
+            const lng = element.lon ?? element.center?.lon;
+            if (!Number.isFinite(+lat) || !Number.isFinite(+lng) || !bounds.contains([+lat, +lng])) return;
+            const tags = element.tags || {};
+            const privateAccess = ['access', 'vehicle', 'motor_vehicle'].some(key =>
+                String(tags[key] || '').trim().toLowerCase() === 'private'
+            );
+            if (privateAccess) return;
+            const title = tags.name || tags.operator || 'Parkplatz';
+            const details = [
+                tags.operator ? `Betreiber: ${tags.operator}` : '',
+                tags.capacity ? `Stellplätze: ${tags.capacity}` : '',
+                tags['capacity:disabled'] ? `Behindertengerechte Stellplätze: ${tags['capacity:disabled']}` : '',
+                tags.fee ? `Gebühren: ${tags.fee === 'yes' ? 'kostenpflichtig' : tags.fee === 'no' ? 'kostenlos' : tags.fee}` : '',
+                tags.access && tags.access !== 'yes' ? `Zugang: ${tags.access}` : '',
+                tags.surface ? `Oberfläche: ${tags.surface}` : '',
+                tags.wheelchair ? `Barrierefrei: ${tags.wheelchair === 'yes' ? 'ja' : tags.wheelchair === 'no' ? 'nein' : tags.wheelchair}` : '',
+                tags.opening_hours ? `Öffnungszeiten: ${tags.opening_hours}` : '',
+                tags.maxstay ? `Maximale Parkdauer: ${tags.maxstay}` : '',
+            ].filter(Boolean);
+            const icon = L.divIcon({
+                className: 'parking-poi-icon',
+                html: '<span aria-hidden="true">P</span>',
+                iconSize: [22, 22], iconAnchor: [11, 11],
+            });
+            L.marker([+lat, +lng], { icon, keyboard: false, bubblingMouseEvents: false })
+                .bindTooltip(`<strong>${escHtml(title)}</strong>${details.length ? `<br>${details.map(escHtml).join('<br>')}` : ''}`, { direction: 'top' })
+                .addTo(parkingLayer);
+            count++;
+        });
+        return count;
+    }
+
+    async function queryParkingBox(box, requestId) {
+        if (requestId !== parkingRequestId) throw new DOMException('Anfrage abgebrochen', 'AbortError');
+        const controller = new AbortController();
+        parkingRequest = controller;
+        // The parking API tries multiple independent Overpass instances in
+        // sequence, so allow that server-side fallback chain to finish.
+        const timeoutId = setTimeout(() => controller.abort(), 45000);
+        try {
+            const response = await fetch('api/parking.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ bbox: box }),
+                signal: controller.signal,
+            });
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(data.error || `HTTP ${response.status}`);
+            if (!Array.isArray(data.elements)) throw new Error('Ungültige Antwort vom Parkplatz-Endpunkt.');
+            return data;
+        } catch (error) {
+            if (requestId !== parkingRequestId) throw new DOMException('Anfrage abgebrochen', 'AbortError');
+            if (error.name === 'AbortError') throw new Error('Zeitüberschreitung beim Parkplatz-Endpunkt.');
+            throw error;
+        } finally {
+            clearTimeout(timeoutId);
+        }
+    }
+
+    function loadParkingPlaces() {
+        clearTimeout(parkingLoadTimer);
+        if (!$('#toggle-parking-layer').prop('checked')) return;
+        parkingLoadTimer = setTimeout(async () => {
+            if (map.getZoom() < 12) {
+                $('#parking-layer-status').text('Zum Laden bitte näher heranzoomen (Zoom 12 oder höher).');
+                parkingLayer.clearLayers();
+                return;
+            }
+            const bounds = map.getBounds();
+            const view = { south: bounds.getSouth(), west: bounds.getWest(), north: bounds.getNorth(), east: bounds.getEast() };
+            const now = Date.now();
+            const entries = LS.get(parkingCacheKey, []).filter(entry =>
+                entry && Array.isArray(entry.elements) && now - entry.savedAt < parkingCacheTtl
+            );
+            const cached = entries.find(entry => entry.bbox.south <= view.south && entry.bbox.west <= view.west
+                && entry.bbox.north >= view.north && entry.bbox.east >= view.east);
+            if (cached) {
+                const count = renderParkingPlaces(cached.elements, bounds);
+                $('#parking-layer-status').text(`${count} Parkplätze · lokal gespeichert · OpenStreetMap`);
+                return;
+            }
+            const step = 0.01;
+            const box = [Math.floor(view.south / step) * step, Math.floor(view.west / step) * step,
+                Math.ceil(view.north / step) * step, Math.ceil(view.east / step) * step];
+            const queryBox = { south: box[0], west: box[1], north: box[2], east: box[3] };
+            const requestId = ++parkingRequestId;
+            parkingRequest?.abort();
+            parkingLayer.clearLayers();
+            $('#parking-layer-status').text('Parkplätze werden geladen …');
+            try {
+                const result = await queryParkingBox(box, requestId);
+                if (requestId !== parkingRequestId || !$('#toggle-parking-layer').prop('checked')) return;
+                const elements = result.elements;
+                const uniqueElements = [...new Map(elements.map((element, index) => [`${element.type || 'item'}:${element.id ?? index}`, element])).values()];
+                const count = renderParkingPlaces(uniqueElements, bounds);
+                const keys = ['name', 'operator', 'capacity', 'capacity:disabled', 'fee', 'access', 'opening_hours', 'parking', 'surface', 'wheelchair', 'maxstay'];
+                const compact = uniqueElements.map(element => ({
+                    lat: element.lat ?? null, lon: element.lon ?? null,
+                    center: element.center ? { lat: element.center.lat, lon: element.center.lon } : undefined,
+                    tags: Object.fromEntries(keys.filter(key => element.tags?.[key]).map(key => [key, element.tags[key]])),
+                }));
+                entries.unshift({ savedAt: now, bbox: queryBox, elements: compact });
+                LS.set(parkingCacheKey, entries.slice(0, 8));
+                $('#parking-layer-status').text(`${count} Parkplätze · ${result.source || 'OpenStreetMap'}`);
+            } catch (error) {
+                if (error.name === 'AbortError') return;
+                $('#parking-layer-status').text(`Parkplatzdaten nicht erreichbar: ${error.message || 'Verbindungsfehler'}`);
+            }
+        }, 450);
+    }
+    async function refreshParkingDataAfterGeocacheSync() {
+        const bounds = map.getBounds();
+        const step = 0.01;
+        const box = [
+            Math.floor(bounds.getSouth() / step) * step,
+            Math.floor(bounds.getWest() / step) * step,
+            Math.ceil(bounds.getNorth() / step) * step,
+            Math.ceil(bounds.getEast() / step) * step,
+        ];
+        try {
+            const response = await fetch('api/parking.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ bbox: box, refresh: true }),
+            });
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(data.error || `HTTP ${response.status}`);
+            // Drop the browser copy so the next render reads the refreshed DB entry.
+            LS.set(parkingCacheKey, []);
+            if ($('#toggle-parking-layer').prop('checked')) loadParkingPlaces();
+        } catch (error) {
+            if ($('#toggle-parking-layer').prop('checked')) {
+                $('#parking-layer-status').text(`Parkplatzdaten nach Sync nicht aktualisiert: ${error.message || 'Verbindungsfehler'}`);
+            }
+        }
+    }
+    $('#toggle-parking-layer').on('change', function () {
+        const enabled = this.checked;
+        LS.set('parkingLayer', enabled);
+        if (enabled) {
+            parkingLayer.addTo(map);
+            map.attributionControl?.addAttribution('Parkplatzdaten © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>');
+            loadParkingPlaces();
+        } else {
+            clearTimeout(parkingLoadTimer);
+            parkingRequest?.abort();
+            parkingRequestId++;
+            parkingLayer.clearLayers();
+            map.removeLayer(parkingLayer);
+            map.attributionControl?.removeAttribution('Parkplatzdaten © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>');
+            $('#parking-layer-status').text('');
+        }
+    });
+    map.on('moveend', loadParkingPlaces);
+    if (parkingLayerEnabled) {
+        parkingLayer.addTo(map);
+        map.attributionControl?.addAttribution('Parkplatzdaten © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>');
+        loadParkingPlaces();
     }
 
     map.on('moveend zoomend', () => {
@@ -898,12 +1642,114 @@ $(function () {
         1304: 'W', 1858: '★', 3653: '★★', 3773: '⚗',
     };
 
+    const mapFilterTypeLabels = {
+        2: 'Traditional Cache', 3: 'Multi-Cache', 4: 'Virtual Cache', 5: 'Letterbox Hybrid',
+        6: 'Event', 8: 'Mystery Cache', 9: 'Project A.P.E.', 11: 'Webcam Cache',
+        12: 'Locationless Cache', 13: 'CITO Event', 137: 'EarthCache', 453: 'Mega-Event',
+        1304: 'GPS Adventures Exhibit', 1858: 'Wherigo', 3653: 'Community Celebration Event',
+        3773: 'Geocaching HQ', 3774: 'HQ Celebration', 4738: 'HQ Block Party', 7005: 'Giga-Event',
+    };
+    let mapCacheFilters = {
+        types: Object.keys(mapFilterTypeLabels),
+        statuses: ['active', 'disabled', 'archived', 'waypoint'],
+        found: ['found', 'notFound'],
+    };
+    const mapFilterStatuses = { active: 'Aktiv', disabled: 'Deaktiviert', archived: 'Archiviert', waypoint: 'Eigene Wegpunkte' };
+
+    function cacheFoundFilterState(cache) {
+        return Number(cache.found_by_user) === 1 || cache.found_by_user === true ? 'found' : 'notFound';
+    }
+
+    function cachePassesMapFilters(cache) {
+        return mapCacheFilters.types.includes(String(cache.cache_type))
+            && mapCacheFilters.statuses.includes(String(cache.status || 'active'))
+            && mapCacheFilters.found.includes(cacheFoundFilterState(cache));
+    }
+
+    function ownWaypointPassesMapFilters() {
+        return mapCacheFilters.statuses.includes('waypoint');
+    }
+
+    function renderMapFilterMenu(caches = []) {
+        const foundCounts = {
+            found: caches.filter(cache => cacheFoundFilterState(cache) === 'found').length,
+            notFound: caches.filter(cache => cacheFoundFilterState(cache) === 'notFound').length,
+        };
+        caches.forEach(cache => {
+            const id = String(cache.cache_type);
+            if (!(id in mapFilterTypeLabels)) {
+                mapFilterTypeLabels[id] = cache.cache_type_name || `Cache-Typ ${id}`;
+                mapCacheFilters.types.push(id);
+            }
+        });
+        $('#map-filter-statuses').html(Object.entries(mapFilterStatuses).map(([value, label]) =>
+            `<label class="map-filter-option"><input class="form-check-input map-filter-input" type="checkbox" data-filter-group="statuses" value="${value}"${mapCacheFilters.statuses.includes(value) ? ' checked' : ''}><span>${label}</span></label>`
+        ).join(''));
+        $('#map-filter-found').html([
+            ['found', 'Gefunden'], ['notFound', 'Nicht gefunden'],
+        ].map(([value, label]) =>
+            `<label class="map-filter-option"><input class="form-check-input map-filter-input" type="checkbox" data-filter-group="found" value="${value}"${mapCacheFilters.found.includes(value) ? ' checked' : ''}><span>${label} (${foundCounts[value]})</span></label>`
+        ).join(''));
+        $('#map-filter-types').html(Object.entries(mapFilterTypeLabels).map(([value, label]) =>
+            `<label class="map-filter-option"><input class="form-check-input map-filter-input" type="checkbox" data-filter-group="types" value="${value}"${mapCacheFilters.types.includes(value) ? ' checked' : ''}><span>${escHtml(label)}</span></label>`
+        ).join(''));
+        const visibilityCount = mapCacheFilters.statuses.filter(id => id in mapFilterStatuses).length
+            + mapCacheFilters.found.filter(id => ['found', 'notFound'].includes(id)).length;
+        const visibilityTotal = Object.keys(mapFilterStatuses).length + 2;
+        const typeCount = Object.keys(mapFilterTypeLabels).filter(id => mapCacheFilters.types.includes(id)).length;
+        const typeTotal = Object.keys(mapFilterTypeLabels).length;
+        $('#toggle-map-visibility')
+            .prop('checked', visibilityCount === visibilityTotal)
+            .prop('indeterminate', visibilityCount > 0 && visibilityCount < visibilityTotal);
+        $('#toggle-all-cache-types')
+            .prop('checked', typeCount === typeTotal)
+            .prop('indeterminate', typeCount > 0 && typeCount < typeTotal);
+        const allTypesSelected = Object.keys(mapFilterTypeLabels).every(id => mapCacheFilters.types.includes(id));
+        const allStatusesSelected = Object.keys(mapFilterStatuses).every(id => mapCacheFilters.statuses.includes(id));
+        const allFoundSelected = ['found', 'notFound'].every(id => mapCacheFilters.found.includes(id));
+        const hasActiveFilters = !allTypesSelected || !allStatusesSelected || !allFoundSelected;
+        $('#btn-map-filters').toggleClass('filtered', hasActiveFilters);
+        $('#btn-map-filters').attr('title', hasActiveFilters ? 'Cache-Filter aktiv' : 'Cache-Arten und Status filtern');
+    }
+
+    renderMapFilterMenu();
+    L.DomEvent.disableClickPropagation(document.getElementById('map-filter-menu'));
+    L.DomEvent.disableClickPropagation(document.getElementById('btn-map-filters'));
+    $('#btn-map-filters').on('click', function () {
+        const open = $('#map-filter-menu').hasClass('d-none');
+        $('#map-filter-menu').toggleClass('d-none', !open);
+        $('#map-style-menu, #map-overlay-menu').addClass('d-none');
+        $('#btn-map-styles, #btn-map-overlays').removeClass('active').attr('aria-expanded', 'false');
+        $(this).toggleClass('active', open).attr('aria-expanded', String(open));
+        if (open) positionMapMenu('#map-filter-menu', '#btn-map-filters');
+    });
+    $(document).on('change', '.map-filter-input', function () {
+        const group = this.dataset.filterGroup;
+        const values = mapCacheFilters[group];
+        mapCacheFilters[group] = this.checked
+            ? [...new Set([...values, this.value])]
+            : values.filter(value => value !== this.value);
+        renderMapFilterMenu(panelCaches);
+        renderCaches(panelCaches);
+    });
+    $('#toggle-map-visibility').on('change', function () {
+        mapCacheFilters.statuses = this.checked ? Object.keys(mapFilterStatuses) : [];
+        mapCacheFilters.found = this.checked ? ['found', 'notFound'] : [];
+        renderMapFilterMenu(panelCaches);
+        renderCaches(panelCaches);
+    });
+    $('#toggle-all-cache-types').on('change', function () {
+        mapCacheFilters.types = this.checked ? Object.keys(mapFilterTypeLabels) : [];
+        renderMapFilterMenu(panelCaches);
+        renderCaches(panelCaches);
+    });
+
     function cacheIcon(type, status, found, foundDate) {
         const col    = status === 'archived' ? '#9ca3af' : (TYPE_COLOR[type] || '#6b7280');
         const sym    = TYPE_SYMBOL[type] || '#';
         const isLong = sym.length > 1;
         const fs     = sym.length > 2 ? 5 : isLong ? 6.5 : 8.5;
-        const filter = status === 'archived' ? 'grayscale(80%) opacity(.5)'
+        const filter = status === 'archived' ? 'grayscale(75%) opacity(.65)'
                      : status === 'disabled' ? 'opacity(.55)' : '';
         const svgPin = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="28" viewBox="0 0 20 28">'
             + '<path d="M10 1C5.03 1 1 5.03 1 10c0 7 9 17 9 17s9-10 9-17c0-4.97-4.03-9-9-9z"'
@@ -911,10 +1757,9 @@ $(function () {
             + '<text x="10" y="10.5" text-anchor="middle" dominant-baseline="middle"'
             + ' font-size="' + fs + '" font-weight="700" fill="#fff" font-family="Arial,sans-serif">' + sym + '</text>'
             + '</svg>';
-        const fallback = filter ? '<div style="filter:' + filter + '">' + svgPin + '</div>' : svgPin;
         const styleAttr = filter ? ' style="filter:' + filter + ';width:22px;height:22px;object-fit:contain"'
                                  : ' style="width:22px;height:22px;object-fit:contain"';
-        const svgUri = 'data:image/svg+xml,' + encodeURIComponent(fallback);
+        const svgUri = 'data:image/svg+xml,' + encodeURIComponent(svgPin);
         const badge = found
             ? '<div style="position:absolute;top:-3px;right:-3px;width:11px;height:11px;background:#eab308;border-radius:50%;border:1.5px solid #fff;display:flex;align-items:center;justify-content:center;">'
               + '<svg width="6" height="5" viewBox="0 0 7 6" fill="none"><path d="M1 3l1.5 1.5L6 1" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
@@ -959,6 +1804,9 @@ $(function () {
     const markerMap = {};
     let focusedCacheGc = null;
     let globalSearchCaches = [];
+    let cacheMarkersVisible = true;
+    LS.set('cacheMarkersVisible', true);
+    $('#toggle-cache-markers').prop('checked', cacheMarkersVisible);
 
     function focusCacheOnMap(gcCode) {
         let marker = markerMap[gcCode];
@@ -969,10 +1817,18 @@ $(function () {
                 : '';
             marker = L.marker([c.lat, c.lng], { icon: cacheIcon(c.cache_type, c.status, c.found_by_user, c.found_date) });
             marker.bindTooltip(`<strong>${escHtml(c.name)}</strong><br><span>${escHtml(c.gc_code)}</span><br>${escHtml(c.cache_type_name)} · D${c.difficulty}/T${c.terrain}${foundNote}`, { direction: 'top', offset: [0, -15] });
-            marker.on('click', function () { if (routeSelectMode) mapClickRouteSelect(c.gc_code); else showDetail(c.gc_code); });
+            marker.on('click', function () {
+                hideSidePanelsOnMapClick();
+                if (routeSelectMode) mapClickRouteSelect(c.gc_code, true); else showDetail(c.gc_code);
+            });
             markerMap[gcCode] = marker;
         }
         if (!marker) return;
+        if (!cacheMarkersVisible) {
+            focusedCacheGc = gcCode;
+            map.flyTo(marker.getLatLng(), 12, { duration: 0.5 });
+            return;
+        }
         const previous = focusedCacheGc && markerMap[focusedCacheGc];
         if (clusteringOn && previous && previous !== marker) {
             map.removeLayer(previous);
@@ -987,6 +1843,14 @@ $(function () {
     }
 
     function renderCaches(caches) {
+        renderMapFilterMenu(caches);
+        Object.values(ownWaypointMarkers).forEach(marker => {
+            if (ownWaypointPassesMapFilters()) {
+                if (!map.hasLayer(marker)) marker.addTo(map);
+            } else if (map.hasLayer(marker)) {
+                map.removeLayer(marker);
+            }
+        });
         // cluster.clearLayers() rebuilds from internal _layers via _generateInitialClusters,
         // so old markers would reappear. removeLayers() actually removes them from internal state.
         const oldMarkers = Object.values(markerMap);
@@ -1015,11 +1879,14 @@ $(function () {
                 { direction: 'top', offset: [0, -15] }
             );
             m.on('click', function () {
-                if (routeSelectMode) { mapClickRouteSelect(c.gc_code); }
+                hideSidePanelsOnMapClick();
+                if (routeSelectMode) { mapClickRouteSelect(c.gc_code, true); }
                 else                 { showDetail(c.gc_code); }
             });
-            if (clusteringOn && c.gc_code !== focusedCacheGc) { cluster.addLayer(m); }
-            else { map.addLayer(m); }
+            if (cacheMarkersVisible && (selIdx > -1 || cachePassesMapFilters(c))) {
+                if (clusteringOn && c.gc_code !== focusedCacheGc) { cluster.addLayer(m); }
+                else { map.addLayer(m); }
+            }
             markerMap[c.gc_code] = m;
         });
 
@@ -1071,6 +1938,7 @@ $(function () {
                 const note = d.skipped ? '(DB-Cache)' : '(geocaching.com)';
                 setStatus(`${d.message} ${note}`, 'text-success');
                 loadFromDB();
+                if (!d.skipped) refreshParkingDataAfterGeocacheSync();
                 switchToViewMode();
             } else {
                 setStatus('Fehler: ' + d.error, 'text-danger');
@@ -1222,6 +2090,17 @@ $(function () {
             $.get('api/cache_detail.php', { gc_code: c.gc_code, refresh_details: 1 })
                 .done(function (d) {
                     if (!d.success) { $('#modal-recent-logs').empty(); return; }
+                    if (d.cache && d.cache.gc_code === currentCache?.gc_code) {
+                        currentCache = d.cache;
+                        if (cacheReg[d.cache.gc_code]) cacheReg[d.cache.gc_code].status = d.cache.status;
+                        refreshAllMarkerIcons();
+                        $('#cache-modal-body').html(buildModalHtml(currentCache, currentLogTotals, currentRecentLogs));
+                        bindHintDecoder('#cache-modal-body');
+                        if (detailCacheGc === d.cache.gc_code) {
+                            $('#sidebar-detail').html(buildDetailHtml(currentCache));
+                            bindHintDecoder('#sidebar-detail');
+                        }
+                    }
                     if (d.log_totals  && d.log_totals.length)  { currentLogTotals  = d.log_totals;  $('#modal-log-totals').html(buildModalLogTotalsHtml(d.log_totals)); }
                     if (d.recent_logs && d.recent_logs.length) { currentRecentLogs = d.recent_logs; $('#modal-recent-logs').html(buildRecentLogsHtml(d.recent_logs)); }
                     else $('#modal-recent-logs').html('<p class="text-muted small">Keine Logs verfügbar.</p>');
@@ -1286,6 +2165,19 @@ $(function () {
             archived: '<span class="badge bg-secondary">Archiviert</span>',
         }[status] || '');
 
+        const needsMaintenance = Array.isArray(c.attributes) && c.attributes.some(attribute =>
+            Number(attribute.id) === 42 && (attribute.isApplicable === true || attribute.isApplicable === 1 || attribute.isApplicable === '1')
+        );
+        const statusNotices = [];
+        if (c.status === 'archived') {
+            statusNotices.push('<div class="alert alert-secondary py-2 px-3 mb-3" role="status"><strong>Archiviert:</strong> Dieser Cache ist dauerhaft archiviert und kann in der Regel nicht mehr gesucht werden.</div>');
+        } else if (c.status === 'disabled') {
+            statusNotices.push('<div class="alert alert-warning py-2 px-3 mb-3" role="status"><strong>Deaktiviert:</strong> Dieser Cache ist vorübergehend deaktiviert.</div>');
+        }
+        if (needsMaintenance) {
+            statusNotices.push('<div class="alert alert-warning py-2 px-3 mb-3" role="status"><strong>Wartung erforderlich:</strong> Für diesen Cache wurde Wartungsbedarf gemeldet.</div>');
+        }
+
         const foundRow = c.found_by_user
             ? `<tr><th style="color:#a16207">✓ Gefunden</th><td style="color:#a16207">${c.found_date || 'Datum unbekannt'}</td></tr>`
             : '';
@@ -1303,6 +2195,30 @@ $(function () {
                 <div class="border rounded p-3 bg-light cache-description">${c.short_description}</div>
                </section>`
             : '';
+
+        const attributeSlugs = {
+            1:'dogs',2:'fee',3:'rappelling',4:'boat',5:'scuba',6:'kids',7:'onehour',8:'scenic',9:'hiking',10:'climbing',
+            11:'wading',12:'swimming',13:'available',14:'night',15:'winter',16:'cactus',17:'poisonoak',18:'dangerousanimals',
+            19:'ticks',20:'mine',21:'cliff',22:'hunting',23:'danger',24:'wheelchair',25:'parking',26:'public',27:'water',
+            28:'restrooms',29:'phone',30:'picnic',31:'camping',32:'bicycles',33:'motorcycles',34:'quads',35:'jeeps',
+            36:'snowmobiles',37:'horses',38:'campfires',39:'thorn',40:'stealth',41:'stroller',42:'firstaid',43:'cow',
+            44:'flashlight',45:'landf',46:'rv',47:'field_puzzle',48:'UV',49:'snowshoes',50:'skiis',51:'s-tool',
+            52:'nightcache',53:'parkngrab',54:'AbandonedBuilding',55:'hike_short',56:'hike_med',57:'hike_long',
+            58:'fuel',59:'food',60:'wirelessbeacon',61:'partnership',62:'seasonal',63:'touristOK',64:'treeclimbing',
+            65:'frontyard',66:'teamwork'
+        };
+        const attributes = Array.isArray(c.attributes) ? c.attributes : [];
+        const attributesSection = attributes.length ? `<section class="mb-4">
+          <h6 class="text-uppercase text-muted fw-semibold mb-2" style="letter-spacing:.05em;font-size:.75rem;">Attribute</h6>
+          <div class="d-flex flex-wrap gap-2">${attributes.map(attribute => {
+              const id = Number(attribute.id);
+              const on = attribute.isApplicable === true || attribute.isApplicable === 1 || attribute.isApplicable === '1';
+              const slug = attributeSlugs[id];
+              const label = String(attribute.name || `Attribut ${id}`);
+              const iconUrl = slug ? `https://www.geocaching.com/images/attributes/${encodeURIComponent(slug)}-${on ? 'yes' : 'no'}.gif` : '';
+              return `<span class="cache-attribute" title="${escHtml(label)}: ${on ? 'Ja' : 'Nein'}">${iconUrl ? `<img src="${iconUrl}" alt="" loading="lazy" onerror="this.hidden=true">` : '<span class="cache-attribute-fallback">i</span>'}<span>${escHtml(label)}</span></span>`;
+          }).join('')}</div>
+        </section>` : '';
 
         const hintSection = c.encoded_hints
             ? `<section class="mb-4">
@@ -1331,6 +2247,8 @@ $(function () {
   <span class="text-muted small">${escHtml(c.cache_type_name || '')} · ${escHtml(c.container_size || '–')}</span>
 </div>
 
+${statusNotices.join('')}
+
 <div class="row g-2 mb-3">
   <div class="col-6">
     <div class="border rounded p-2 text-center">
@@ -1356,6 +2274,7 @@ $(function () {
 </table>
 
 ${shortDesc}
+${attributesSection}
 ${longDesc}
 ${hintSection}
 ${logSection}
@@ -1581,11 +2500,23 @@ ${recentSection}`;
     let routeLayer      = null;
     let routeKmLayer    = null;
     let routeGeometryPoints = [];
+    let routeProfileCache = null;
+    let activeRouteProfileData = null;
     let routeCsvCodes   = [];
     let inRouteMode     = false;
     let routeSelectMode = false;
     let savedRoutes = [];
     let editingSavedRouteId = null;
+    let calculatedRouteMetrics = null;
+    function routeSelectionSignature() {
+        return JSON.stringify({
+            points: selOrder.map(id => {
+                const point = getWaypoint(id);
+                return point ? [String(id), Number(point.lat), Number(point.lng)] : [String(id)];
+            }),
+            roundtrip: !!$('#chk-roundtrip').prop('checked'),
+        });
+    }
     $('#chk-route-km-labels').prop('checked', LS.get('routeKmLabels', true));
     $(document).on('change', '#chk-route-km-labels', function () {
         LS.set('routeKmLabels', this.checked);
@@ -1605,11 +2536,11 @@ ${recentSection}`;
     function getWaypoint(id) {
         if (ownWaypoints[id]) {
             const wp = ownWaypoints[id];
-            return { id: String(id), name: wp.name, lat: +wp.lat, lng: +wp.lng, isCache: false, isHome: Number(wp.is_home) === 1, color: Number(wp.is_home) === 1 ? '#0d6efd' : '#7c3aed' };
+            return { id: String(id), name: wp.name, lat: +wp.lat, lng: +wp.lng, isCache: false, isHome: Number(wp.is_home) === 1, color: Number(wp.is_home) === 1 ? '#fff' : '#7c3aed' };
         }
         if (customWaypoints[id]) {
             const wp = customWaypoints[id];
-            return { id: String(id), name: wp.name, lat: wp.lat, lng: wp.lng, isCache: !!wp.isCache, isHome: !!wp.isHome, gc_code: wp.gc_code || null, color: wp.isHome ? '#0d6efd' : wp.isCache ? '#6b7280' : '#7c3aed' };
+            return { id: String(id), name: wp.name, lat: wp.lat, lng: wp.lng, isCache: !!wp.isCache, isHome: !!wp.isHome, gc_code: wp.gc_code || null, color: wp.isHome ? '#fff' : wp.isCache ? '#6b7280' : '#7c3aed' };
         }
         const c = cacheReg[id];
         if (c) return { id: String(id), gc_code: c.gc_code, name: c.name, lat: +c.lat, lng: +c.lng, isCache: true, color: TYPE_COLOR[c.cache_type] || '#6b7280' };
@@ -1630,10 +2561,11 @@ ${recentSection}`;
         const key = ownWaypointKey(wp);
         if (ownWaypointMarkers[key]) map.removeLayer(ownWaypointMarkers[key]);
         const marker = L.marker([+wp.lat, +wp.lng], { icon: makeOwnWaypointIcon(wp.id) })
-            .bindTooltip(`<strong>${Number(wp.is_home) === 1 ? '⌂ Home · ' : ''}${escHtml(wp.name)}</strong><br><span>Eigener Wegpunkt</span>`, { direction: 'top' })
-            .addTo(map);
+            .bindTooltip(`<strong>${Number(wp.is_home) === 1 ? '⌂ Home · ' : ''}${escHtml(wp.name)}</strong><br><span>Eigener Wegpunkt</span>`, { direction: 'top' });
+        if (ownWaypointPassesMapFilters()) marker.addTo(map);
         marker.on('click', function () {
-            if (routeSelectMode) mapClickRouteSelect(key);
+            hideSidePanelsOnMapClick();
+            if (routeSelectMode) mapClickRouteSelect(key, true);
             else map.setView(marker.getLatLng(), Math.max(map.getZoom(), 12));
         });
         ownWaypointMarkers[key] = marker;
@@ -1746,6 +2678,7 @@ ${recentSection}`;
             const key = ownWaypointKey(data.waypoint);
             if (routeSelectMode && !selOrder.includes(key)) selOrder.push(key);
             await loadOwnWaypoints();
+            if (routeSelectMode) scheduleLastPlanSave();
             refreshOwnWaypointMarkers();
             updateRouteBtn();
             bootstrap.Modal.getInstance(document.getElementById('waypoint-modal'))?.hide();
@@ -1789,6 +2722,7 @@ ${recentSection}`;
             const data = await response.json();
             if (!response.ok || !data.success) throw new Error(data.error || 'Wegpunkt konnte nicht gelöscht werden.');
             selOrder = selOrder.filter(item => item !== key);
+            scheduleLastPlanSave(selOrder.length === 0);
             await loadOwnWaypoints();
             refreshAllMarkerIcons();
             updateRouteBtn();
@@ -1811,8 +2745,9 @@ ${recentSection}`;
         }
 
         if (!on) {
+            flushLastPlanSave();
             editingSavedRouteId = null;
-            $('#btn-save-route').text('Route speichern');
+            $('#btn-save-route').text('Sichern');
             inRouteMode = false;
             selOrder = [];
             refreshAllMarkerIcons();
@@ -1832,18 +2767,43 @@ ${recentSection}`;
     }
 
     // ── Zoom buttons ──────────────────────────────────────────────────────────
-    $('#btn-zoom-in').on('click',  function () { map.zoomIn(); });
-    $('#btn-zoom-out').on('click', function () { map.zoomOut(); });
+    $('#btn-zoom-in').on('click',  function () { zoomMapAtPointer(1); });
+    $('#btn-zoom-out').on('click', function () { zoomMapAtPointer(-1); });
 
     // ── Clustering toggle ─────────────────────────────────────────────────────
     let clusteringOn = LS.get('clustering', true);
     $('#btn-toggle-cluster').toggleClass('active', clusteringOn);
 
+    $('#toggle-cache-markers').on('change', function () {
+        cacheMarkersVisible = this.checked;
+        LS.set('cacheMarkersVisible', cacheMarkersVisible);
+        const markers = Object.values(markerMap);
+        if (!cacheMarkersVisible) {
+            cluster.removeLayers(markers);
+            markers.forEach(marker => { if (map.hasLayer(marker)) map.removeLayer(marker); });
+            return;
+        }
+        if (clusteringOn) {
+            if (!map.hasLayer(cluster)) map.addLayer(cluster);
+            Object.entries(markerMap).forEach(([gc, marker]) => {
+                map.removeLayer(marker);
+                if (gc === focusedCacheGc) map.addLayer(marker);
+                else cluster.addLayer(marker);
+            });
+        } else {
+            map.removeLayer(cluster);
+            markers.forEach(marker => map.addLayer(marker));
+        }
+    });
+
     $('#btn-toggle-cluster').on('click', function () {
         clusteringOn = !clusteringOn;
         LS.set('clustering', clusteringOn);
         $(this).toggleClass('active', clusteringOn);
-        if (clusteringOn) {
+        if (!cacheMarkersVisible) {
+            cluster.removeLayers(Object.values(markerMap));
+            map.removeLayer(cluster);
+        } else if (clusteringOn) {
             Object.entries(markerMap).forEach(([gc, m]) => {
                 map.removeLayer(m);
                 if (gc === focusedCacheGc) map.addLayer(m);
@@ -1859,7 +2819,10 @@ ${recentSection}`;
     function setPanelOpen(open) {
         $('#list-panel').toggleClass('panel-open', open);
         $('#map-area').css('margin-left', open ? '300px' : '');
-        $('#map-area').one('transitionend', () => map.invalidateSize({ animate: false }));
+        $('#map-area').one('transitionend', () => {
+            map.invalidateSize({ animate: false });
+            positionOpenMapMenus();
+        });
         LS.set('panel', open);
     }
 
@@ -1882,15 +2845,16 @@ ${recentSection}`;
     });
 
     // Cache clicked in route-mode: toggle selection
-    function mapClickRouteSelect(gcCode) {
+    function mapClickRouteSelect(gcCode, fromMap = false) {
         gcCode = String(gcCode);
         // Route points include caches and persisted/custom waypoints.
         if (!getWaypoint(gcCode)) return;
         const idx = selOrder.indexOf(gcCode);
         if (idx > -1) { selOrder.splice(idx, 1); } else { selOrder.push(gcCode); }
+        scheduleLastPlanSave(selOrder.length === 0);
         refreshAllMarkerIcons();
         updateSavedRouteMarkerIcons();
-        if (!$('#list-panel').hasClass('panel-open')) setPanelOpen(true);
+        if (!fromMap && !$('#list-panel').hasClass('panel-open')) setPanelOpen(true);
         renderSelectionList();
         updateRouteBtn();
     }
@@ -1921,7 +2885,7 @@ ${recentSection}`;
         const rows = selOrder.map(function (id, i) {
             const wp = getWaypoint(id);
             if (!wp) return '';
-            const numBadge = `<span class="route-num" style="background:${wp.color};flex-shrink:0">${i + 1}</span>`;
+            const numBadge = `<span class="route-num" style="background:${wp.color};color:${wp.isHome ? '#111827' : '#fff'};flex-shrink:0">${i + 1}</span>`;
             const sub = wp.isCache ? '' : '<div style="font-size:.7rem;color:#9ca3af">Eigener Wegpunkt</div>';
             return `<div class="sel-row d-flex align-items-center gap-2 px-2 py-1 border-bottom" draggable="true" data-id="${escHtml(id)}">
                 <span class="drag-handle text-muted" style="cursor:grab;user-select:none;font-size:1.1rem;line-height:1;flex-shrink:0">⠿</span>
@@ -1946,6 +2910,7 @@ ${recentSection}`;
         } else {
             selOrder.reverse();
         }
+        scheduleLastPlanSave(selOrder.length === 0);
         refreshAllMarkerIcons();
         updateSavedRouteMarkerIcons();
         renderSelectionList();
@@ -1957,6 +2922,7 @@ ${recentSection}`;
         e.stopPropagation();
         const id = $(this).data('id');
         selOrder = selOrder.filter(x => x !== id);
+        scheduleLastPlanSave(selOrder.length === 0);
         if (customWaypoints[id]) {
             map.removeLayer(customWaypoints[id].marker);
             delete customWaypoints[id];
@@ -1993,6 +2959,7 @@ ${recentSection}`;
             }
         }
         dragId = null;
+        scheduleLastPlanSave();
         updateSavedRouteMarkerIcons();
         renderSelectionList();
         updateRouteBtn();
@@ -2013,26 +2980,31 @@ ${recentSection}`;
     function renderCacheList(caches, globalSearch = false) {
         if (!globalSearch) panelCaches = caches;
         caches.forEach(c => { cacheReg[c.gc_code] = c; });
+        renderMapFilterMenu(globalSearch ? panelCaches : caches);
 
         if (routeSelectMode) { renderSelectionList(); return; }
         if (inRouteMode) return;
 
         $('#cache-search-wrap').removeClass('d-none');
         const query = $('#cache-search').val().trim().toLocaleLowerCase('de');
-        const filtered = query ? caches.filter(c =>
+        const mapFilteredCaches = caches.filter(cachePassesMapFilters);
+        const filtered = query ? mapFilteredCaches.filter(c =>
             String(c.name || '').toLocaleLowerCase('de').includes(query) ||
             String(c.gc_code || '').toLocaleLowerCase('de').includes(query)
-        ) : caches;
+        ) : mapFilteredCaches;
         const filteredWaypoints = Object.entries(ownWaypoints).filter(([, wp]) => !query ||
             String(wp.name || '').toLocaleLowerCase('de').includes(query) ||
             `${(+wp.lat).toFixed(6)} ${(+wp.lng).toFixed(6)}`.includes(query)
         );
         const resultCount = filtered.length + filteredWaypoints.length;
-        const totalCount = caches.length + Object.keys(ownWaypoints).length;
+        const totalCount = mapFilteredCaches.length + Object.keys(ownWaypoints).length;
         $('#list-count').text(query ? (globalSearch ? `${resultCount} Treffer` : `${resultCount}/${totalCount}`) : totalCount);
 
         if (!filtered.length && !filteredWaypoints.length) {
-            $('#list-body').html(`<p class="text-muted small p-3">${totalCount ? 'Keine passenden Caches oder Wegpunkte.' : 'Keine Caches in der Ansicht.'}</p>`);
+            const emptyMessage = totalCount ? 'Keine passenden Caches oder Wegpunkte.'
+                : caches.length ? 'Alle Caches sind durch die Kartenfilter ausgeblendet.'
+                : 'Keine Caches in der Ansicht.';
+            $('#list-body').html(`<p class="text-muted small p-3">${emptyMessage}</p>`);
             return;
         }
 
@@ -2152,6 +3124,7 @@ ${recentSection}`;
     function toggleCacheWaypoint(gc) {
         const idx = selOrder.indexOf(gc);
         if (idx > -1) { selOrder.splice(idx, 1); } else { selOrder.push(gc); }
+        scheduleLastPlanSave(selOrder.length === 0);
         refreshAllMarkerIcons();
         if (routeSelectMode) renderSelectionList();
         else updateSelBadges();
@@ -2200,6 +3173,7 @@ ${recentSection}`;
         const key = String(id || '');
         const point = getWaypoint(key);
         if (!point) return;
+        if (point.isCache && !cacheMarkersVisible) return;
         const marker = customWaypoints[key]?.marker || ownWaypointMarkers[key] || markerMap[point.gc_code || key];
         if (enabled && point.isCache && marker && !marker._icon && clusteringOn && cluster.hasLayer(marker)) {
             cluster.removeLayer(marker);
@@ -2245,6 +3219,50 @@ ${recentSection}`;
         $('#btn-reverse-selection').prop('disabled', n < 2);
     }
 
+    let lastPlanSaveTimer = null;
+    let pendingLastPlanSnapshot = null;
+    let lastPlanSaveQueue = Promise.resolve();
+
+    function flushLastPlanSave() {
+        clearTimeout(lastPlanSaveTimer);
+        lastPlanSaveTimer = null;
+        if (pendingLastPlanSnapshot) {
+            const snapshot = pendingLastPlanSnapshot;
+            pendingLastPlanSnapshot = null;
+            lastPlanSaveQueue = lastPlanSaveQueue.catch(() => {}).then(async () => {
+                const clear = snapshot.points.length === 0;
+                const response = await fetch('api/routes.php', {
+                    method: clear ? 'DELETE' : 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(clear
+                        ? { last_plan: true }
+                        : { last_plan: true, points: snapshot.points, roundtrip: snapshot.roundtrip }),
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) throw new Error(data.error || 'Letzte Planung konnte nicht gesichert werden.');
+            }).catch(error => console.error('Letzte Planung konnte nicht automatisch gesichert werden:', error));
+        }
+        return lastPlanSaveQueue;
+    }
+
+    function scheduleLastPlanSave(clearWhenEmpty = false) {
+        if (!routeSelectMode || inRouteMode) return;
+        if (!selOrder.length && !clearWhenEmpty) return;
+        pendingLastPlanSnapshot = {
+            points: selOrder.map(id => getWaypoint(id)).filter(Boolean).map(point => ({
+                name: String(point.name || point.gc_code || 'Wegpunkt'),
+                lat: Number(point.lat),
+                lng: Number(point.lng),
+                gc_code: point.gc_code || null,
+                is_home: !!point.isHome,
+            })),
+            roundtrip: $('#chk-roundtrip').prop('checked'),
+        };
+        clearTimeout(lastPlanSaveTimer);
+        lastPlanSaveTimer = setTimeout(flushLastPlanSave, 350);
+    }
+    $('#chk-roundtrip').on('change', scheduleLastPlanSave);
+
     async function refreshSavedRoutes() {
         try {
             const response = await fetch('api/routes.php');
@@ -2262,15 +3280,22 @@ ${recentSection}`;
             $('#saved-routes-list').html('<div class="small text-muted p-2">Noch keine Routen gespeichert.</div>');
             return;
         }
-        const rows = savedRoutes.map(route => `<div class="saved-route-row d-flex align-items-center gap-2 p-2">
+        const rows = savedRoutes.map(route => {
+            const points = Array.isArray(route.points) ? route.points : [];
+            const hasDistance = Number.isFinite(Number(route.distance_m)) && route.distance_m !== null;
+            const lengthLabel = hasDistance
+                ? ` · ${route.distance_approximate ? 'ca. ' : ''}${(Number(route.distance_m) / 1000).toLocaleString('de-DE', { minimumFractionDigits: 1, maximumFractionDigits: 1 })} km`
+                : ' · Länge noch nicht berechnet';
+            return `<div class="saved-route-row d-flex align-items-center gap-2 p-2">
             <div class="flex-grow-1 overflow-hidden">
                 <button type="button" class="saved-route-edit saved-route-name" data-id="${Number(route.id)}" title="Route benutzen">${escHtml(route.name)}</button>
-                <div class="small text-muted">${(route.points || []).length} Punkte</div>
+                <div class="small text-muted">${points.length} Punkte${lengthLabel}${route.is_last_plan ? ' · wird automatisch aktualisiert' : ''}</div>
             </div>
             <div class="saved-route-actions d-flex flex-nowrap gap-1">
-                <button type="button" class="btn btn-sm btn-outline-danger saved-route-delete" data-id="${Number(route.id)}" aria-label="Route ${escHtml(route.name)} löschen">Löschen</button>
+                ${route.is_last_plan ? '' : `<button type="button" class="btn btn-sm btn-outline-danger saved-route-delete" data-id="${Number(route.id)}" aria-label="Route ${escHtml(route.name)} löschen">Löschen</button>`}
             </div>
-        </div>`).join('');
+        </div>`;
+        }).join('');
         $('#saved-routes-list').html(rows);
     }
 
@@ -2278,13 +3303,22 @@ ${recentSection}`;
         const existing = savedRoutes.find(route => Number(route.id) === Number(editingSavedRouteId));
         $('#route-name-title').text(existing ? 'Route bearbeiten' : 'Route speichern');
         $('#route-name-submit').text(existing ? 'Änderungen speichern' : 'Speichern');
+        $('#route-save-new').toggleClass('d-none', !existing);
         $('#route-name-input').val(existing?.name || '').trigger('focus');
         $('#route-save-status').text('');
         bootstrap.Modal.getOrCreateInstance(document.getElementById('route-name-modal')).show();
     });
 
+    $('#route-save-new').on('click', function () {
+        const existing = savedRoutes.find(route => Number(route.id) === Number(editingSavedRouteId));
+        if (existing && $('#route-name-input').val().trim() === existing.name) {
+            $('#route-name-input').val(`Kopie von ${existing.name}`);
+        }
+    });
+
     $('#route-name-form').on('submit', async function (event) {
         event.preventDefault();
+        const saveAsNew = event.originalEvent?.submitter?.id === 'route-save-new';
         const name = $('#route-name-input').val().trim();
         const points = selOrder.map(id => getWaypoint(id)).filter(Boolean).map(point => ({
             name: point.name, lat: +point.lat, lng: +point.lng,
@@ -2292,17 +3326,23 @@ ${recentSection}`;
             is_home: !!point.isHome,
         }));
         if (points.length < 2) { $('#route-save-status').text('Bitte mindestens zwei Routenpunkte auswählen.'); return; }
-        const $submit = $('#route-name-submit').prop('disabled', true);
+        const $submit = $('#route-name-submit, #route-save-new').prop('disabled', true);
         $('#route-save-status').removeClass('text-danger').addClass('text-muted').text('Route wird gespeichert …');
         try {
+            const routeMetrics = calculatedRouteMetrics?.signature === routeSelectionSignature() ? calculatedRouteMetrics : null;
             const response = await fetch('api/routes.php', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: editingSavedRouteId, name, points, roundtrip: $('#chk-roundtrip').prop('checked') }),
+                body: JSON.stringify({
+                    id: saveAsNew ? null : editingSavedRouteId,
+                    name, points, roundtrip: $('#chk-roundtrip').prop('checked'),
+                    distance_m: routeMetrics?.distance_m ?? null,
+                    distance_approximate: routeMetrics?.approximate ?? false,
+                }),
             });
             const data = await response.json();
             if (!response.ok || !data.success) throw new Error(data.error || 'Route konnte nicht gespeichert werden.');
             editingSavedRouteId = Number(data.route.id);
-            $('#btn-save-route').text('Änderungen speichern');
+            $('#btn-save-route').text('Update');
             await refreshSavedRoutes();
             bootstrap.Modal.getInstance(document.getElementById('route-name-modal'))?.hide();
         } catch (error) {
@@ -2319,14 +3359,15 @@ ${recentSection}`;
         Object.entries(customWaypoints).forEach(([id, wp]) => {
             if (!wp.savedRoutePoint || !wp.marker) return;
             const index = selOrder.indexOf(id);
-            const label = index >= 0 ? index + 1 : '⚑';
-            wp.marker.setIcon(L.divIcon({ className: '', html: `<div class="custom-wp-pin${wp.isHome ? ' home-location' : ''}">${label}</div>`, iconSize: [26, 26], iconAnchor: [13, 13] }));
+            wp.marker.setIcon(index >= 0
+                ? makeRouteIcon(index + 1)
+                : L.divIcon({ className: '', html: `<div class="custom-wp-pin${wp.isHome ? ' home-location' : ''}">⚑</div>`, iconSize: [26, 26], iconAnchor: [13, 13] }));
         });
     }
 
     $(document).on('click', '.saved-route-edit', function () {
         const route = savedRoutes.find(item => Number(item.id) === Number($(this).data('id')));
-        if (!route || !Array.isArray(route.points) || route.points.length < 2) return;
+        if (!route || !Array.isArray(route.points) || route.points.length < (route.is_last_plan ? 1 : 2)) return;
         if (selOrder.length && !window.confirm('Die aktuelle Routenauswahl durch diese gespeicherte Route ersetzen?')) return;
         if (!routeSelectMode) setRouteSelectMode(true);
         inRouteMode = false;
@@ -2338,6 +3379,12 @@ ${recentSection}`;
         $('#chk-roundtrip').prop('checked', !!route.roundtrip);
         const bounds = [];
         route.points.forEach(point => {
+            const gcCode = String(point.gc_code || '').toUpperCase();
+            if (gcCode && markerMap[gcCode]) {
+                selOrder.push(gcCode);
+                bounds.push([+point.lat, +point.lng]);
+                return;
+            }
             const id = `_wp_${++customWpCounter}`;
             const savedPoint = {
                 name: String(point.name || 'Routenpunkt'), lat: +point.lat, lng: +point.lng,
@@ -2345,23 +3392,32 @@ ${recentSection}`;
                 marker: null,
             };
             const savedIcon = L.divIcon({ className: '', html: `<div class="custom-wp-pin${savedPoint.isHome ? ' home-location' : ''}">⚑</div>`, iconSize: [26, 26], iconAnchor: [13, 13] });
-            savedPoint.marker = L.marker([savedPoint.lat, savedPoint.lng], { draggable: true, icon: savedIcon })
+            savedPoint.marker = L.marker([savedPoint.lat, savedPoint.lng], { draggable: true, icon: savedIcon, zIndexOffset: 1000 })
                 .bindTooltip(escHtml(savedPoint.name), { direction: 'top' }).addTo(map);
-            savedPoint.marker.on('click', () => mapClickRouteSelect(id));
+            savedPoint.marker.on('click', () => {
+                hideSidePanelsOnMapClick();
+                mapClickRouteSelect(id, true);
+            });
             savedPoint.marker.on('dragend', event => {
                 const position = event.target.getLatLng();
                 savedPoint.lat = position.lat;
                 savedPoint.lng = position.lng;
+                scheduleLastPlanSave();
             });
             customWaypoints[id] = savedPoint;
             selOrder.push(id);
             bounds.push([savedPoint.lat, savedPoint.lng]);
         });
-        editingSavedRouteId = Number(route.id);
-        $('#btn-save-route').text('Änderungen speichern');
+        calculatedRouteMetrics = Number.isFinite(Number(route.distance_m)) && route.distance_m !== null
+            ? { signature: routeSelectionSignature(), distance_m: Number(route.distance_m), approximate: !!route.distance_approximate }
+            : null;
+        editingSavedRouteId = route.is_last_plan ? null : Number(route.id);
+        $('#btn-save-route').text(route.is_last_plan ? 'Sichern' : 'Update');
+        refreshAllMarkerIcons();
         updateSavedRouteMarkerIcons();
         renderSelectionList();
         updateRouteBtn();
+        scheduleLastPlanSave();
         if (bounds.length) map.fitBounds(bounds, { padding: [40, 40], maxZoom: 13 });
         bootstrap.Modal.getInstance(document.getElementById('saved-routes-modal'))?.hide();
     });
@@ -2378,7 +3434,7 @@ ${recentSection}`;
             if (!response.ok || !data.success) throw new Error(data.error || 'Route konnte nicht gelöscht werden.');
             if (Number(editingSavedRouteId) === id) {
                 editingSavedRouteId = null;
-                $('#btn-save-route').text('Route speichern');
+                $('#btn-save-route').text('Sichern');
             }
             await refreshSavedRoutes();
         } catch (error) { window.alert(error.message); }
@@ -2388,6 +3444,7 @@ ${recentSection}`;
 
     $(document).on('click', '#btn-clear-sel', function () {
         selOrder = [];
+        scheduleLastPlanSave(true);
         Object.values(customWaypoints).forEach(wp => map.removeLayer(wp.marker));
         customWaypoints = {};
         customWpCounter = 0;
@@ -2399,6 +3456,7 @@ ${recentSection}`;
     $(document).on('click', '#btn-calc-route', calcRoute);
 
     async function calcRoute() {
+        const planSignature = routeSelectionSignature();
         let caches = selOrder.map(id => getWaypoint(id)).filter(Boolean);
         if (caches.length < 2) return;
         if ($('#chk-roundtrip').prop('checked')) caches = [...caches, { ...caches[0] }];
@@ -2430,6 +3488,12 @@ ${recentSection}`;
             });
             caches.forEach(c => allCoords.push([+c.lng, +c.lat]));
         }
+        const distanceMeters = legs.reduce((sum, leg) => sum + leg.distance, 0);
+        calculatedRouteMetrics = {
+            signature: planSignature,
+            distance_m: distanceMeters,
+            approximate: legs.some(leg => leg.fallback),
+        };
         const geometry = allCoords.length > 1 ? { type: 'LineString', coordinates: allCoords } : null;
 
         // Draw route on map
@@ -2452,10 +3516,12 @@ ${recentSection}`;
         $('#list-footer').html(
             '<div class="d-grid gap-1">' +
               '<button id="btn-back-sel" class="btn btn-sm btn-outline-secondary">← Zurück zur Auswahl</button>' +
+              '<button id="btn-route-profile" class="btn btn-sm btn-outline-info">Höhenprofil &amp; Wegbeschaffenheit</button>' +
               '<div class="d-flex gap-1">' +
                 '<button id="btn-export-route" class="btn btn-sm btn-success flex-fill">CSV</button>' +
                 '<button id="btn-export-route-gpx" class="btn btn-sm btn-outline-success flex-fill" title="Route als GPX-Datei speichern" aria-label="Route als GPX-Datei speichern">GPX</button>' +
                 '<button id="btn-save-route-image" class="btn btn-sm btn-outline-primary flex-fill">PNG</button>' +
+                '<button id="btn-whatsapp-route" class="btn btn-sm btn-outline-success flex-fill">WhatsApp</button>' +
                 '<button id="btn-gpx-help" class="btn btn-sm btn-outline-secondary px-2" title="GPX in Google Maps verwenden" aria-label="Hilfe zum GPX-Import">?</button>' +
               '</div>' +
             '</div>'
@@ -2463,6 +3529,176 @@ ${recentSection}`;
         $('#btn-route-mode').addClass('route-calculated');
         routeCsvCodes = caches.filter(c => c.isCache !== false && c.gc_code).map(c => c.gc_code);
     }
+
+    const routeSurfaceLabels = {
+        paved: 'Befestigt', asphalt: 'Asphalt', concrete: 'Beton', 'concrete:plates': 'Betonplatten', paving_stones: 'Pflastersteine',
+        sett: 'Kopfsteinpflaster', cobblestone: 'Kopfsteinpflaster', gravel: 'Schotter', fine_gravel: 'Feiner Schotter',
+        compacted: 'Verdichteter Untergrund', unpaved: 'Unbefestigt', dirt: 'Erde', ground: 'Naturboden', earth: 'Erde',
+        grass: 'Gras', sand: 'Sand', mud: 'Schlamm', wood: 'Holz', woodchips: 'Holzhackschnitzel', pebblestone: 'Kiesel',
+        track: 'Fahrspur', footway: 'Fußweg', path: 'Pfad', cycleway: 'Radweg', service: 'Zufahrtsweg',
+        residential: 'Wohnstraße', road: 'Straße', unknown: 'Nicht erfasst',
+    };
+    function routeSurfaceLabel(value) {
+        const key = String(value || 'unknown');
+        return routeSurfaceLabels[key] || key.replaceAll('_', ' ');
+    }
+    function routeProfileDistanceLabel(meters) {
+        return meters >= 1000 ? `${(meters / 1000).toFixed(meters >= 10000 ? 1 : 2)} km` : `${Math.round(meters)} m`;
+    }
+    function renderRouteProfileChart(points, routeDistance) {
+        const known = (points || []).filter(point => point.elevation_m !== null && point.elevation_m !== undefined && Number.isFinite(Number(point.elevation_m)));
+        if (known.length < 2) return '<p class="small text-muted mb-0">Für diese Route liegen nicht genügend Höhenwerte vor.</p>';
+        const width = 820, height = 230, left = 48, right = 14, top = 16, bottom = 32;
+        const min = Math.min(...known.map(point => +point.elevation_m));
+        const max = Math.max(...known.map(point => +point.elevation_m));
+        const span = Math.max(10, max - min);
+        const maxDistance = Math.max(1, +routeDistance || +known[known.length - 1].distance_m || 1);
+        const x = distance => left + (width - left - right) * distance / maxDistance;
+        const y = value => top + (height - top - bottom) * (max - value) / span;
+        const line = known.map((point, i) => `${i ? 'L' : 'M'}${x(+point.distance_m || 0).toFixed(1)},${y(+point.elevation_m).toFixed(1)}`).join(' ');
+        const area = `${line} L${x(+known[known.length - 1].distance_m || 0).toFixed(1)},${height - bottom} L${x(+known[0].distance_m || 0).toFixed(1)},${height - bottom} Z`;
+        const grid = [0, .5, 1].map(ratio => {
+            const gy = top + (height - top - bottom) * ratio;
+            const elevation = Math.round(max - span * ratio);
+            return `<line class="profile-grid" x1="${left}" y1="${gy}" x2="${width - right}" y2="${gy}"/><text class="profile-label" x="${left - 7}" y="${gy + 4}" text-anchor="end">${elevation} m</text>`;
+        }).join('');
+        return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Höhenprofil zwischen ${Math.round(min)} und ${Math.round(max)} Metern">
+            ${grid}<path class="profile-area" d="${area}"/><path class="profile-line" d="${line}"/>
+            <line id="route-profile-cursor-line" x1="${left}" x2="${left}" y1="${top}" y2="${height - bottom}" stroke="#374151" stroke-dasharray="3 3" display="none"/>
+            <circle id="route-profile-cursor-dot" cx="${left}" cy="${top}" r="5" fill="#f59e0b" stroke="#fff" stroke-width="2" display="none"/>
+            <text class="profile-label" x="${left}" y="${height - 7}">0 km</text>
+            <text class="profile-label" x="${width - right}" y="${height - 7}" text-anchor="end">${(maxDistance / 1000).toFixed(1)} km</text>
+        </svg>`;
+    }
+    function renderRouteProfile(data) {
+        const elevation = data.elevation;
+        const stats = [
+            ['Strecke', routeProfileDistanceLabel(data.distance_m)],
+            ['Aufstieg', elevation ? `${elevation.ascent_m} m` : '–'],
+            ['Abstieg', elevation ? `${elevation.descent_m} m` : '–'],
+            ['Höhenlage', elevation ? `${elevation.min_m}–${elevation.max_m} m` : '–'],
+        ];
+        $('#route-profile-summary').html(stats.map(([label, value]) => `<div class="route-profile-stat"><strong>${escHtml(value)}</strong><span>${escHtml(label)}</span></div>`).join(''));
+        activeRouteProfileData = data;
+        $('#route-profile-cursor-readout').text('Entlang des Profils bewegen für Streckenhöhe');
+        $('#route-profile-chart').html(elevation ? renderRouteProfileChart(elevation.points, data.distance_m) : '<p class="small text-muted">Höhendaten konnten nicht geladen werden.</p>');
+        const elevationSources = { eudem25m: 'EU-DEM 25 m', srtm90m: 'SRTM 90 m' };
+        $('#route-profile-elevation-source').text(elevation
+            ? `Höhenmodell: ${(elevation.datasets || []).map(name => elevationSources[name] || name).join(', ') || 'unbekannt'}`
+            : 'Höhenmodell nicht verfügbar.');
+
+        const palette = ['#369b62', '#83b94a', '#c5bd38', '#e5a63b', '#dd7b3d', '#c95e4b', '#7e8f65', '#668ca0', '#9b83a8', '#9ca3af'];
+        function renderRouteBreakdown(selector, categories, kind, helperText = '') {
+            if (!categories) {
+                $(selector).html('<p class="small text-muted">Diese Angaben konnten nicht geladen werden.</p>');
+                return;
+            }
+            const all = (categories.categories || []).filter(item => +item.percent > 0).sort((a, b) => +b.meters - +a.meters);
+            const visible = all.slice(0, 9);
+            if (all.length > 9) {
+                visible.push({
+                    key: '__other', meters: all.slice(9).reduce((sum, item) => sum + +item.meters, 0),
+                    percent: all.slice(9).reduce((sum, item) => sum + +item.percent, 0),
+                });
+            }
+            const labelFor = key => {
+                if (key === '__missing_surface') return 'Keine Oberflächenangabe';
+                if (key === '__missing_waytype') return 'Wegtyp nicht erfasst';
+                if (key === '__missing_tracktype') return 'Keine Angabe';
+                if (key === '__missing_smoothness') return 'Keine Angabe';
+                if (key === '__unmatched') return 'Keine OSM-Wegdaten';
+                if (key === '__other') return 'Weitere';
+                if (kind === 'surface') return routeSurfaceLabel(key);
+                if (kind === 'tracktype') {
+                    const firmness = { grade1: 'Grad 1 · fest', grade2: 'Grad 2 · überwiegend fest', grade3: 'Grad 3 · gemischt', grade4: 'Grad 4 · überwiegend weich', grade5: 'Grad 5 · weich' };
+                    return firmness[key] || String(key).replaceAll('_', ' ');
+                }
+                if (kind === 'smoothness') {
+                    const quality = { excellent: 'Sehr gut', good: 'Gut', intermediate: 'Mittel', bad: 'Schlecht', very_bad: 'Sehr schlecht', horrible: 'Schlimm', very_horrible: 'Sehr schlimm', impassable: 'Unpassierbar' };
+                    return quality[key] || String(key).replaceAll('_', ' ');
+                }
+                const names = { footway: 'Fußweg', path: 'Pfad', track: 'Wirtschaftsweg', steps: 'Treppe', cycleway: 'Radweg', service: 'Zufahrtsweg', residential: 'Wohnstraße', pedestrian: 'Fußgängerweg', bridleway: 'Reitweg', unclassified: 'Nebenstraße', primary: 'Hauptstraße', secondary: 'Landstraße', tertiary: 'Kreisstraße', living_street: 'Verkehrsberuhigter Bereich' };
+                return names[key] || String(key).replaceAll('_', ' ');
+            };
+            const bar = visible.map((item, index) => {
+                const percent = Math.max(0, Math.min(100, +item.percent));
+                return `<span class="route-profile-bar-segment" style="width:${percent}%;background:${palette[index % palette.length]}" title="${escHtml(labelFor(item.key))}: ${percent.toFixed(1)} %"></span>`;
+            }).join('');
+            const legend = visible.map((item, index) => `<div class="route-profile-legend-row">
+                <div class="route-profile-legend-name"><span class="route-profile-legend-swatch" style="background:${palette[index % palette.length]}"></span><span class="route-profile-legend-label">${escHtml(labelFor(item.key))}</span></div>
+                <span class="route-profile-legend-distance">${escHtml(routeProfileDistanceLabel(item.meters))}</span>
+                <span class="route-profile-legend-percent">${escHtml(Number(item.percent).toFixed(1))} %</span>
+            </div>`).join('');
+            $(selector).html(visible.length
+                ? `<div class="route-profile-bars" role="img" aria-label="Aufteilung der Route">${bar}</div><div class="route-profile-legend">${legend}</div>${helperText ? `<p class="small text-muted mt-2 mb-0">${escHtml(helperText)}</p>` : ''}`
+                : '<p class="small text-muted">Keine passenden OSM-Wegdaten gefunden.</p>');
+        }
+        renderRouteBreakdown('#route-profile-waytypes', data.way_types, 'waytype');
+        renderRouteBreakdown('#route-profile-surfaces', data.surface, 'surface', data.surface ? `${data.surface.tagged_percent} % der Strecke haben eine explizite Oberflächenangabe.` : '');
+        renderRouteBreakdown('#route-profile-tracktypes', data.tracktypes, 'tracktype', data.tracktypes ? `${data.tracktypes.tagged_percent} % mit tracktype-Angabe.` : '');
+        renderRouteBreakdown('#route-profile-smoothness', data.smoothness, 'smoothness', data.smoothness ? `${data.smoothness.tagged_percent} % mit smoothness-Angabe.` : '');
+        const warnings = (data.warnings || []).map(escHtml);
+        $('#route-profile-status').toggleClass('text-danger', warnings.length > 0 && !elevation && !surface)
+            .toggleClass('text-muted', warnings.length === 0 || !!elevation || !!surface)
+            .html(warnings.length ? warnings.join('<br>') : 'Profildaten geladen.');
+    }
+    $(document).on('pointermove', '#route-profile-chart svg', function (event) {
+        const points = activeRouteProfileData?.elevation?.points || [];
+        const bounds = this.getBoundingClientRect();
+        if (!points.length || bounds.width <= 0) return;
+        const viewX = (event.originalEvent.clientX - bounds.left) * 820 / bounds.width;
+        const left = 48, right = 14;
+        const ratio = Math.max(0, Math.min(1, (viewX - left) / (820 - left - right)));
+        const distance = ratio * (+activeRouteProfileData.distance_m || 0);
+        const known = points.filter(point => point.elevation_m !== null && point.elevation_m !== undefined);
+        if (!known.length) return;
+        const nearest = known.reduce((best, point) => Math.abs(+point.distance_m - distance) < Math.abs(+best.distance_m - distance) ? point : best, known[0]);
+        const x = left + ratio * (820 - left - right);
+        const elevationPoints = known.map(point => +point.elevation_m);
+        const min = Math.min(...elevationPoints), max = Math.max(...elevationPoints), span = Math.max(10, max - min);
+        const y = 16 + (230 - 16 - 32) * (max - +nearest.elevation_m) / span;
+        $('#route-profile-cursor-line').attr({ x1: x, x2: x, display: 'inline' });
+        $('#route-profile-cursor-dot').attr({ cx: x, cy: y, display: 'inline' });
+        $('#route-profile-cursor-readout').text(`${routeProfileDistanceLabel(distance)} · ${Math.round(+nearest.elevation_m)} m`);
+    });
+    $(document).on('pointerout', '#route-profile-chart svg', function (event) {
+        if (this.contains(event.originalEvent.relatedTarget)) return;
+        $('#route-profile-cursor-line, #route-profile-cursor-dot').attr('display', 'none');
+        $('#route-profile-cursor-readout').text('Entlang des Profils bewegen für Streckenhöhe');
+    });
+    $(document).on('click', '#btn-route-profile', async function () {
+        const coordinates = routeGeometryPoints.map(point => [+point.lng, +point.lat]);
+        if (coordinates.length < 2) return;
+        const signature = JSON.stringify(coordinates.map(pair => pair.map(value => +value.toFixed(5))));
+        $('#route-profile-summary, #route-profile-chart, #route-profile-waytypes, #route-profile-surfaces, #route-profile-tracktypes, #route-profile-smoothness, #route-profile-elevation-source').empty();
+        $('#route-profile-status').removeClass('text-danger').addClass('text-muted').text('Höhen- und OSM-Daten werden geladen …');
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('route-profile-modal')).show();
+        if (routeProfileCache?.signature === signature
+            && routeProfileCache.data.surface
+            && routeProfileCache.data.elevation
+            && !(routeProfileCache.data.warnings || []).length) {
+            renderRouteProfile(routeProfileCache.data);
+            return;
+        }
+        const $button = $(this).prop('disabled', true);
+        try {
+            const response = await fetch('api/route_profile.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ coordinates }),
+                signal: AbortSignal.timeout(85000),
+            });
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(data.error || 'Streckenprofil konnte nicht berechnet werden.');
+            // A transient provider failure must not poison the cache for this route.
+            routeProfileCache = data.surface && data.elevation && !(data.warnings || []).length
+                ? { signature, data }
+                : null;
+            renderRouteProfile(data);
+        } catch (error) {
+            $('#route-profile-status').removeClass('text-muted').addClass('text-danger').text(error.message || 'Profildaten konnten nicht geladen werden.');
+        } finally { $button.prop('disabled', false); }
+    });
 
     function createRouteKilometerMarkers(points) {
         const markers = [];
@@ -2613,30 +3849,58 @@ ${recentSection}`;
         return canvas;
     }
 
-    $(document).on('click', '#btn-save-route-image', function () {
+    function downloadRouteSnapshot() {
+        const canvas = drawRouteMapSnapshot();
+        return new Promise((resolve, reject) => canvas.toBlob(blob => {
+            if (!blob) return reject(new Error('Bildexport nicht möglich (Kartenkacheln ohne CORS-Freigabe).'));
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `geocaching-route-${new Date().toISOString().slice(0, 10)}.png`;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            resolve();
+        }, 'image/png'));
+    }
+    $(document).on('click', '#btn-save-route-image', async function () {
         const $button = $(this).prop('disabled', true);
         try {
-            const canvas = drawRouteMapSnapshot();
-            canvas.toBlob(blob => {
-                if (!blob) {
-                    $('#list-footer').prepend('<div class="small text-danger">Bildexport nicht möglich (Kartenkacheln ohne CORS-Freigabe).</div>');
-                    $button.prop('disabled', false);
-                    return;
-                }
-                const url = URL.createObjectURL(blob);
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = `geocaching-route-${new Date().toISOString().slice(0, 10)}.png`;
-                document.body.appendChild(link);
-                link.click();
-                link.remove();
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
-                $button.prop('disabled', false);
-            }, 'image/png');
+            await downloadRouteSnapshot();
         } catch (error) {
-            $('#list-footer').prepend(`<div class="small text-danger">${escHtml(error.message || 'Bildexport fehlgeschlagen.')}</div>`);
-            $button.prop('disabled', false);
-        }
+            console.error('Routenbild konnte nicht exportiert werden:', error);
+        } finally { $button.prop('disabled', false); }
+    });
+    $(document).on('click', '#btn-whatsapp-route', async function () {
+        const $button = $(this).prop('disabled', true);
+        const routePoints = selOrder.map(id => getWaypoint(id)).filter(Boolean);
+        const distance = routeGeometryPoints.slice(1).reduce((sum, point, index) => sum + map.distance(routeGeometryPoints[index], point), 0);
+        const lines = routePoints.slice(0, 35).map((point, index) => {
+            const label = String(point.name || point.gc_code || `Wegpunkt ${index + 1}`).replace(/[\r\n]+/g, ' ').trim();
+            const links = [];
+            if (point.gc_code) links.push(`https://coord.info/${encodeURIComponent(point.gc_code)}`);
+            const lat = Number(point.lat), lng = Number(point.lng);
+            if (!point.isCache && Number.isFinite(lat) && Number.isFinite(lng)
+                && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+                links.push(`https://maps.google.com/?q=${lat.toFixed(6)},${lng.toFixed(6)}`);
+            }
+            const coordinates = !point.isCache && Number.isFinite(lat) && Number.isFinite(lng)
+                && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180
+                ? ` (${lat.toFixed(6)}, ${lng.toFixed(6)})`
+                : '';
+            return `${index + 1}. ${links.length ? `${links.join(' · ')} · ` : ''}${label}${coordinates}`;
+        });
+        if (routePoints.length > lines.length) lines.push(`… und ${routePoints.length - lines.length} weitere Wegpunkte`);
+        const message = [`Geocaching-Route · ${routePoints.length} Punkte · ${(distance / 1000).toFixed(1)} km`, ...lines].join('\n');
+        const whatsappUrl = `https://wa.me/?text=${encodeURIComponent(message)}`;
+        // Open synchronously from the click gesture so popup blockers allow WhatsApp Web.
+        window.open(whatsappUrl, '_blank', 'noopener,noreferrer');
+        try {
+            await downloadRouteSnapshot();
+        } catch (error) {
+            console.error('Routenbild für WhatsApp konnte nicht exportiert werden:', error);
+        } finally { $button.prop('disabled', false); }
     });
 
     $(document).on('click', '#btn-export-route', function () {
@@ -2742,7 +4006,7 @@ ${recentSection}`;
             const col = c.color || '#6b7280';
             const sub = c.isCache === false ? 'Eigener Wegpunkt' : (c.cache_type_name || '');
             h += '<div class="route-waypoint" data-route-id="' + escHtml(c.id || c.gc_code || '') + '">' +
-                 '<span class="route-num" style="background:' + col + '">' + (i + 1) + '</span>' +
+                 '<span class="route-num" style="background:' + col + ';color:' + (c.isHome ? '#111827' : '#fff') + '">' + (i + 1) + '</span>' +
                  '<div class="overflow-hidden flex-grow-1">' +
                    '<div class="small fw-semibold text-truncate">' + escHtml(c.name) + '</div>' +
                    '<div style="font-size:.71rem;color:#6b7280">' + escHtml(sub) + '</div>' +

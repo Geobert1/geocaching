@@ -35,6 +35,7 @@ try {
                     $webData['long_description']  ?? null,
                     $webData['encoded_hints']     ?? null
                 );
+                $db->updateCacheStatus($gcCode, $webData['status'] ?? null);
                 $logTotals = $webData['log_totals'] ?? [];
 
                 // Merge last-date-per-type + recent log entries (only on explicit refresh)
