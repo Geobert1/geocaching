@@ -8,8 +8,8 @@
 /session/cookies.txt
 
 # Lokale Geocache-Datenbank und SQLite-Dateien
-/data/*.sqlite
-/data/*.sqlite-*
+#/data/*.sqlite
+#/data/*.sqlite-*
 
 # Lokale Agent-/Editor-Einstellungen
 /.claude/settings.local.json
